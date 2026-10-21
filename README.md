@@ -6,7 +6,7 @@ Not affiliated with or supported by Fastrepl, Inc. “Anarlog” is used only to
 
 ## Download and install on Apple Silicon
 
-CI builds a real `aarch64-apple-darwin` `.app` and `.dmg` on GitHub's standard `macos-15` ARM64 runner. Builds are ad-hoc signed and are not Apple-notarized.
+CI builds a real `aarch64-apple-darwin` `.app` and `.dmg` on GitHub's standard `macos-26` ARM64 runner. Builds are ad-hoc signed and are not Apple-notarized.
 
 1. Download the DMG and `SHA256SUMS.txt` from the GitHub Actions artifact attached to a green commit or from a project prerelease.
 2. Verify it: `shasum -a 256 -c SHA256SUMS.txt`.
@@ -43,7 +43,7 @@ Product analytics, crash-reporting credentials, vendor update feeds, billing, cl
 
 ## Build from source
 
-Requirements: macOS 15+, Xcode command-line tools, Node 22, pnpm 11.1.1, and Rust 1.94.0.
+Requirements: macOS 15+, Xcode 26 with the Metal Toolchain component, Node 22, pnpm 11.1.1, and Rust 1.96.0.
 
 ```text
 pnpm install --frozen-lockfile

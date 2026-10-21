@@ -21,7 +21,7 @@ env:
 jobs:
   test-and-build:
     name: test + build aarch64 app/dmg
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 120
     steps:
       - name: Check out source
