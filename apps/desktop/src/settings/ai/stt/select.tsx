@@ -748,22 +748,6 @@ export function useConfiguredMapping(): {
         return [provider.id, { configured: false, models: [] }];
       }
 
-      if (provider.id === "anarlog") {
-        return [
-          provider.id,
-          {
-            configured: true,
-            models: [
-              {
-                id: "cloud",
-                isDownloaded: billing.isPaid,
-                category: "latest" as const,
-              },
-            ],
-          },
-        ];
-      }
-
       if (provider.id === "soniqo") {
         const models = buildOnDeviceModelEntries(
           soniqoModels,

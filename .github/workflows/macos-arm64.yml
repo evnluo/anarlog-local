@@ -92,6 +92,7 @@ jobs:
           apps/desktop/src-tauri/src/lib.rs
           apps/desktop/src/ai/hooks/useLLMConnection.test.ts
           apps/desktop/src/ai/hooks/useLLMConnection.ts
+          apps/desktop/src/ai/provider-routing.test.ts
           apps/desktop/src/analytics.ts
           apps/desktop/src/audio-player/provider.tsx
           apps/desktop/src/audio-player/timeline.tsx
