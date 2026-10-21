@@ -1,0 +1,256 @@
+import { i18n } from "@lingui/core";
+import { randomUUID } from "node:crypto";
+import * as React from "react";
+import { vi } from "vitest";
+
+// Compiled @lingui/core/macro calls hit the real global i18n; give it a
+// locale so untranslated messages fall back to their English source.
+i18n.load("en", {});
+i18n.activate("en");
+
+Object.defineProperty(globalThis.crypto, "randomUUID", { value: randomUUID });
+
+if (typeof globalThis.ResizeObserver === "undefined") {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as typeof ResizeObserver;
+}
+
+Object.defineProperty(globalThis.window, "__TAURI_INTERNALS__", {
+  value: {
+    metadata: {
+      currentWindow: {
+        label: "main",
+      },
+      currentWebview: {
+        label: "main",
+      },
+    },
+    transformCallback: vi.fn((callback: unknown) => {
+      const callbackId = Math.trunc(Math.random() * Number.MAX_SAFE_INTEGER);
+      Object.assign(globalThis.window, {
+        [`_${callbackId}`]: callback,
+      });
+
+      return callbackId;
+    }),
+    unregisterCallback: vi.fn((callbackId: number) => {
+      delete (globalThis.window as unknown as Record<string, unknown>)[
+        `_${callbackId}`
+      ];
+    }),
+    invoke: vi.fn((command: string) =>
+      Promise.resolve(command === "plugin:event|listen" ? 0 : null),
+    ),
+  },
+  writable: true,
+  configurable: true,
+});
+
+Object.defineProperty(globalThis.window, "__TAURI_EVENT_PLUGIN_INTERNALS__", {
+  value: {
+    unregisterListener: vi.fn(),
+  },
+  writable: true,
+  configurable: true,
+});
+
+vi.mock("@tauri-apps/api/path", () => ({
+  resolveResource: vi.fn((path: string) =>
+    Promise.resolve(`/resources/${path}`),
+  ),
+  sep: vi.fn().mockReturnValue("/"),
+}));
+
+vi.mock("@anlg/plugin-db", () => ({
+  CLOUDSYNC_ACTIVITY_DEFERRED_ERROR: "cloudsync_activity_deferred",
+  beginCloudsyncActivity: vi.fn().mockResolvedValue(undefined),
+  endCloudsyncActivity: vi.fn().mockResolvedValue(undefined),
+  isCloudsyncActivityDeferredError: (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    return message === "cloudsync_activity_deferred";
+  },
+  bindCloudsyncAccount: vi.fn().mockResolvedValue(true),
+  configureCloudsyncToken: vi.fn().mockResolvedValue("configured"),
+  configureE2eeReplica: vi.fn().mockResolvedValue("configured"),
+  sealWorkspaceE2eeKeyForRecipients: vi.fn(),
+  execute: vi.fn().mockResolvedValue([]),
+  executeProxy: vi.fn().mockResolvedValue({ rows: [] }),
+  executeTransaction: vi.fn().mockResolvedValue([]),
+  getE2eeIdentityStatus: vi.fn().mockResolvedValue({
+    configured: true,
+    keyId: "abcdefghijklmnopqrstuv",
+  }),
+  getOrCreateE2eeDeviceIdentity: vi
+    .fn()
+    .mockResolvedValue({ publicKey: "A".repeat(43) }),
+  createE2eeIdentity: vi.fn(),
+  inspectE2eeRecoveryKey: vi
+    .fn()
+    .mockResolvedValue({ keyId: "abcdefghijklmnopqrstuv" }),
+  importE2eeIdentity: vi.fn(),
+  importE2eeDeviceEnrollment: vi
+    .fn()
+    .mockResolvedValue({ keyId: "abcdefghijklmnopqrstuv" }),
+  sealE2eeRecoveryKeyForDevice: vi.fn().mockResolvedValue({
+    ephemeralPublicKey: "E".repeat(43),
+    nonce: "N".repeat(32),
+    ciphertext: "C".repeat(100),
+  }),
+  getCloudsyncStatus: vi.fn().mockResolvedValue({
+    cloudsync_enabled: true,
+    extension_loaded: true,
+    configured: false,
+    running: false,
+    network_initialized: false,
+    activity_paused: false,
+    last_sync: null,
+    last_sync_at_ms: null,
+    has_unsent_changes: null,
+    last_error: null,
+    last_error_kind: null,
+    consecutive_failures: 0,
+    deferred_for_capture: false,
+  }),
+  getMeeting: vi.fn(),
+  getMeetingTranscript: vi.fn(),
+  getRecurringMeetingHistory: vi.fn(),
+  listMeetings: vi.fn(),
+  subscribe: vi.fn().mockResolvedValue(() => Promise.resolve()),
+  waitUntilReady: vi.fn().mockResolvedValue(undefined),
+  suspendCloudsync: vi.fn().mockResolvedValue(undefined),
+  suspendCloudsyncAfterAuthLoss: vi.fn().mockResolvedValue(undefined),
+  suspendCloudsyncForSignOut: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("@anlg/plugin-session", () => ({
+  commands: new Proxy({} as Record<string, () => Promise<unknown>>, {
+    get: (target, prop) => {
+      if (typeof prop !== "string") {
+        return undefined;
+      }
+      return (target[prop] ??= () =>
+        Promise.resolve({ status: "ok", data: null }));
+    },
+  }),
+}));
+
+function translate(
+  input:
+    | TemplateStringsArray
+    | string
+    | { message?: string; values?: Record<string, unknown> },
+  ...values: unknown[]
+) {
+  if (typeof input === "string") {
+    return input;
+  }
+
+  if (typeof input === "object" && !("raw" in input)) {
+    let message = input.message ?? "";
+    for (const [key, value] of Object.entries(input.values ?? {})) {
+      message = message.split(`{${key}}`).join(String(value));
+    }
+    return message;
+  }
+
+  return Array.from(input).reduce(
+    (text, part, index) => `${text}${part}${values[index] ?? ""}`,
+    "",
+  );
+}
+
+vi.mock("@lingui/react/macro", () => ({
+  Trans: ({
+    children,
+    id,
+    message,
+    values,
+  }: {
+    children?: React.ReactNode;
+    id?: string;
+    message?: string;
+    values?: Record<string, unknown>;
+  }) =>
+    React.createElement(
+      React.Fragment,
+      null,
+      children ?? translate({ message: message ?? id, values }),
+    ),
+  useLingui: () => ({
+    _: translate,
+    t: translate,
+    i18n: {
+      _: translate,
+      locale: "en",
+      date: (value: string | Date, format?: Intl.DateTimeFormatOptions) =>
+        new Date(value).toLocaleDateString("en", format ?? {}),
+    },
+  }),
+}));
+
+vi.mock("@lingui/react", () => ({
+  I18nProvider: ({ children }: { children?: React.ReactNode }) =>
+    React.createElement(React.Fragment, null, children),
+  Trans: ({
+    children,
+    id,
+    message,
+    values,
+  }: {
+    children?: React.ReactNode;
+    id?: string;
+    message?: string;
+    values?: Record<string, unknown>;
+  }) =>
+    React.createElement(
+      React.Fragment,
+      null,
+      children ?? translate({ message: message ?? id, values }),
+    ),
+  useLingui: () => ({
+    _: translate,
+    t: translate,
+    i18n: {
+      _: translate,
+      locale: "en",
+      date: (value: string | Date, format?: Intl.DateTimeFormatOptions) =>
+        new Date(value).toLocaleDateString("en", format ?? {}),
+    },
+  }),
+}));
+
+vi.mock("@anlg/plugin-analytics", () => ({
+  commands: {
+    event: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    setProperties: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    setDisabled: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    isDisabled: vi.fn().mockResolvedValue({ status: "ok", data: false }),
+  },
+}));
+
+vi.mock("./types/tauri.gen", () => ({
+  commands: {
+    getOnboardingNeeded: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: false }),
+    isCrashReportingEnabled: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: true }),
+    setCrashReportingEnabled: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    showDevtool: vi.fn().mockResolvedValue(true),
+    isAppStoreBuild: vi.fn().mockResolvedValue(false),
+    getPinnedTabs: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    setPinnedTabs: vi.fn().mockResolvedValue({ status: "ok", data: null }),
+    getRecentlyOpenedSessions: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+    setRecentlyOpenedSessions: vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: null }),
+  },
+}));

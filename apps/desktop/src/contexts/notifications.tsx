@@ -1,0 +1,249 @@
+import { t } from "@lingui/core/macro";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  createContext,
+  type ReactNode,
+  useContext,
+  useMemo,
+  useState,
+} from "react";
+
+import {
+  commands as localSttCommands,
+  events as localSttEvents,
+  type ServerStatus,
+  type LocalModel,
+} from "@anlg/plugin-local-stt";
+import { toast } from "@anlg/ui/components/ui/toast";
+import { useMountEffect } from "@anlg/ui/hooks/use-mount-effect";
+
+import { setDownloadedSttSelection } from "~/settings/queries";
+import { useConfigValues } from "~/shared/config";
+import type { DownloadProgress } from "~/sidebar/toast/types";
+import { usePendingSttSelection } from "~/store/zustand/pending-stt-selection";
+import { useTabs } from "~/store/zustand/tabs";
+import { isConfiguredSttModel, isOnDeviceSttModel } from "~/stt/capabilities";
+import { localSttQueries } from "~/stt/useLocalSttModel";
+
+interface NotificationState {
+  hasActiveBanner: boolean;
+  hasActiveEnhancement: boolean;
+  hasActiveDownload: boolean;
+  downloadingModel: string | null;
+  activeDownloads: DownloadProgress[];
+  notificationCount: number;
+  shouldShowBadge: boolean;
+  localSttStatus: ServerStatus | null;
+  isLocalSttModel: boolean;
+}
+
+const NotificationContext = createContext<NotificationState | null>(null);
+
+const MODEL_DISPLAY_NAMES: Partial<Record<LocalModel, string>> = {
+  "apple-speech": "Apple Speech",
+  "soniqo-parakeet-streaming": "Soniqo Parakeet Streaming",
+  "soniqo-parakeet-batch": "Soniqo Parakeet Batch",
+  "am-parakeet-v2": "Parakeet v2",
+  "am-parakeet-v3": "Parakeet v3",
+  "am-whisper-large-v3": "Whisper Large v3",
+  QuantizedTinyEn: "Whisper Tiny (English)",
+  QuantizedSmallEn: "Whisper Small (English)",
+};
+
+export function NotificationProvider({ children }: { children: ReactNode }) {
+  const queryClient = useQueryClient();
+  const queuedDownloads = usePendingSttSelection(
+    (state) => state.queuedDownloads,
+  );
+  const {
+    current_stt_provider,
+    current_stt_model,
+    current_llm_provider,
+    current_llm_model,
+  } = useConfigValues([
+    "current_stt_provider",
+    "current_stt_model",
+    "current_llm_provider",
+    "current_llm_model",
+  ] as const);
+
+  const hasConfigBanner =
+    !isConfiguredSttModel(current_stt_provider, current_stt_model) ||
+    !current_llm_provider ||
+    !current_llm_model;
+
+  const sttModel = isOnDeviceSttModel(current_stt_provider, current_stt_model)
+    ? current_stt_model
+    : null;
+  const isLocalSttModel = !!sttModel;
+
+  const localSttQuery = useQuery({
+    enabled: isLocalSttModel,
+    queryKey: ["local-stt-status", sttModel],
+    refetchInterval: (query) => (query.state.data === "loading" ? 1000 : false),
+    queryFn: async () => {
+      if (!sttModel) return null;
+
+      const serverResult = await localSttCommands.getServerForModel(sttModel);
+      if (serverResult.status !== "ok") return null;
+
+      return serverResult.data?.status ?? null;
+    },
+  });
+
+  const localSttStatus = isLocalSttModel ? (localSttQuery.data ?? null) : null;
+
+  const [activeDownloads, setActiveDownloads] = useState<
+    Map<LocalModel, number>
+  >(new Map());
+
+  useMountEffect(() => {
+    const unlisten = localSttEvents.downloadProgressPayload.listen((event) => {
+      const { model: eventModel, status } = event.payload;
+      const isFailed = typeof status === "object" && "failed" in status;
+      const modelName = MODEL_DISPLAY_NAMES[eventModel] ?? eventModel;
+      usePendingSttSelection.setState((state) => ({
+        queuedDownloads: state.queuedDownloads.filter(
+          (model) => model !== eventModel,
+        ),
+      }));
+      if (status === "completed") {
+        queryClient.setQueryData(
+          localSttQueries.isDownloaded(eventModel).queryKey,
+          { status: "ok", data: true },
+        );
+        toast.success(t`Model downloaded`, { description: modelName });
+      }
+      const pendingSelection = usePendingSttSelection.getState().selection;
+      if (pendingSelection?.model === eventModel) {
+        const clearPendingSelection = () => {
+          if (
+            usePendingSttSelection.getState().selection === pendingSelection
+          ) {
+            usePendingSttSelection.setState({ selection: null });
+          }
+        };
+        if (isFailed) {
+          clearPendingSelection();
+        } else if (status === "completed") {
+          void setDownloadedSttSelection(pendingSelection).then(
+            clearPendingSelection,
+            (error) => {
+              clearPendingSelection();
+              console.error(
+                "[settings] failed to select downloaded model",
+                error,
+              );
+            },
+          );
+        }
+      }
+
+      if (isFailed) {
+        toast.error(`Couldn’t download ${modelName}`, {
+          description: status.failed,
+        });
+      }
+
+      setActiveDownloads((prev) => {
+        const next = new Map(prev);
+        if (isFailed || status === "completed") {
+          next.delete(eventModel);
+        } else if (typeof status === "object" && "downloading" in status) {
+          next.set(eventModel, Math.max(0, Math.min(100, status.downloading)));
+        }
+        return next;
+      });
+    });
+
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  });
+
+  const hasActiveEnhancement = false;
+
+  const currentTab = useTabs(
+    (state: {
+      currentTab: ReturnType<typeof useTabs.getState>["currentTab"];
+    }) => state.currentTab,
+  );
+  const isAiTab =
+    currentTab?.type === "settings" &&
+    ["transcription", "intelligence"].includes(currentTab.state?.tab ?? "");
+
+  const value = useMemo<NotificationState>(() => {
+    const hasActiveBanner = hasConfigBanner && !isAiTab;
+    const hasActiveDownload =
+      activeDownloads.size > 0 || queuedDownloads.length > 0;
+
+    const downloadsArray: DownloadProgress[] = Array.from(
+      activeDownloads.entries(),
+    ).map(([model, progress]) => ({
+      model,
+      displayName: MODEL_DISPLAY_NAMES[model] ?? model,
+      progress,
+    }));
+    for (const model of queuedDownloads) {
+      if (!activeDownloads.has(model)) {
+        downloadsArray.push({
+          model,
+          displayName: MODEL_DISPLAY_NAMES[model] ?? model,
+          progress: 0,
+          isStarting: true,
+        });
+      }
+    }
+
+    const firstDownload = downloadsArray[0];
+    const downloadingModel = firstDownload?.displayName ?? null;
+
+    const notificationCount =
+      (hasActiveBanner ? 1 : 0) +
+      (hasActiveEnhancement ? 1 : 0) +
+      (hasActiveDownload ? 1 : 0);
+
+    return {
+      hasActiveBanner,
+      hasActiveEnhancement,
+      hasActiveDownload,
+      downloadingModel,
+      activeDownloads: downloadsArray,
+      notificationCount,
+      shouldShowBadge: notificationCount > 0,
+      localSttStatus,
+      isLocalSttModel,
+    };
+  }, [
+    hasConfigBanner,
+    hasActiveEnhancement,
+    activeDownloads,
+    queuedDownloads,
+    isAiTab,
+    localSttStatus,
+    isLocalSttModel,
+  ]);
+
+  return (
+    <NotificationContext.Provider value={value}>
+      {children}
+    </NotificationContext.Provider>
+  );
+}
+
+const DEFAULT_NOTIFICATION_STATE: NotificationState = {
+  hasActiveBanner: false,
+  hasActiveEnhancement: false,
+  hasActiveDownload: false,
+  downloadingModel: null,
+  activeDownloads: [],
+  notificationCount: 0,
+  shouldShowBadge: false,
+  localSttStatus: null,
+  isLocalSttModel: false,
+};
+
+export function useNotifications() {
+  const context = useContext(NotificationContext);
+  return context ?? DEFAULT_NOTIFICATION_STATE;
+}

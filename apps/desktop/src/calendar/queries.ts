@@ -1,0 +1,606 @@
+import { useMemo } from "react";
+
+import { commands as calendarCommands } from "@anlg/plugin-calendar";
+import { eventParticipantSchema, type EventParticipant } from "@anlg/store";
+
+import {
+  SESSION_EVENT_MATCH,
+  SESSION_EVENT_ORDER,
+} from "~/calendar/session-event-match";
+import { liveQueryClient, useLiveQuery } from "~/db";
+import { enqueueDatabaseWrite } from "~/db/write-queue";
+import { getSessionEvent } from "~/session/utils";
+import { parseSessionTagNames } from "~/sidebar/item-fields";
+import type {
+  TimelineEventRow,
+  TimelineEventsTable,
+  TimelineSessionRow,
+  TimelineSessionsTable,
+} from "~/sidebar/timeline/utils";
+import { useUndoDelete } from "~/store/zustand/undo-delete";
+
+type TimelineEventSqlRow = Omit<
+  TimelineEventRow,
+  "has_recurrence_rules" | "is_all_day"
+> & {
+  id: string;
+  has_recurrence_rules: boolean | number;
+  is_all_day: boolean | number;
+};
+
+type TimelineSessionSqlRow = Omit<TimelineSessionRow, "tags"> & {
+  id: string;
+  tags_json?: string | null;
+};
+
+type CalendarSqlRow = {
+  id: string;
+  tracking_id_calendar: string;
+  name: string;
+  enabled: boolean | number;
+  provider: string;
+  source: string;
+  color: string;
+  connection_id: string;
+  created_at: string;
+};
+
+type SessionCalendarEventSqlRow = {
+  tracking_id: string;
+  calendar_id: string;
+  title: string;
+  started_at: string;
+  ended_at: string;
+  is_all_day: boolean | number;
+  has_recurrence_rules: boolean | number;
+  recurrence_series_id: string;
+  location: string;
+  meeting_link: string;
+  description: string;
+  participants_json: string;
+};
+
+type CalendarEventStartSqlRow = { started_at: string };
+type CalendarEventMeetingLinkSqlRow = { meeting_link: string };
+
+type CalendarEventSearchSqlRow = {
+  id: string;
+  title: string;
+  started_at: string;
+  ended_at: string;
+  location: string;
+  meeting_link: string;
+  description: string;
+  participant_count: number;
+  linked_session_id: string;
+};
+
+export type CalendarEventSearchResult = {
+  id: string;
+  title: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  location: string | null;
+  meetingLink: string | null;
+  description: string | null;
+  participantCount: number;
+  linkedSessionId: string | null;
+};
+
+type NearbyCalendarEventSqlRow = {
+  id: string;
+  title: string;
+  started_at: string;
+  meeting_link: string;
+  location: string;
+  description: string;
+  participants_json: string | null;
+};
+
+export type NearbyCalendarEvent = {
+  id: string;
+  title: string;
+  meetingLink?: string;
+  location?: string;
+  description?: string;
+  participantNames: string[];
+};
+
+export type SessionCalendarEvent = Omit<
+  SessionCalendarEventSqlRow,
+  "is_all_day" | "has_recurrence_rules" | "participants_json"
+> & {
+  is_all_day: boolean;
+  has_recurrence_rules: boolean;
+  participants: EventParticipant[];
+};
+
+export type CalendarRow = Omit<CalendarSqlRow, "enabled"> & {
+  enabled: boolean;
+};
+
+const EMPTY_EVENTS: Record<string, TimelineEventRow> = {};
+const EMPTY_SESSIONS: Record<string, TimelineSessionRow> = {};
+
+const EMPTY_CALENDARS: CalendarRow[] = [];
+const EMPTY_EVENT_PARTICIPANTS: EventParticipant[] = [];
+
+export function useTimelineTables(): {
+  timelineEventsTable: TimelineEventsTable;
+  timelineSessionsTable: TimelineSessionsTable;
+} {
+  const timelineEventsTable = useTimelineEventsTable();
+  const timelineSessionsTable = useTimelineSessionsTable();
+
+  return { timelineEventsTable, timelineSessionsTable };
+}
+
+export function useTimelineEventsTable(): TimelineEventsTable {
+  const { data: timelineEventsTable = EMPTY_EVENTS } = useLiveQuery<
+    TimelineEventSqlRow,
+    Record<string, TimelineEventRow>
+  >({
+    sql: `
+      SELECT
+        event.id,
+        event.title,
+        event.started_at,
+        event.ended_at,
+        event.calendar_id,
+        event.tracking_id_event,
+        event.has_recurrence_rules,
+        event.recurrence_series_id,
+        event.is_all_day,
+        event.location,
+        event.meeting_link,
+        event.description,
+        calendar.color AS calendar_color,
+        CASE
+          WHEN json_valid(event.attendance_json)
+            THEN json_extract(event.attendance_json, '$.self_status')
+        END AS self_status,
+        session.folder_path AS session_folder
+      FROM events AS event
+      LEFT JOIN calendars AS calendar
+        ON calendar.id = event.calendar_id AND calendar.deleted_at IS NULL
+      LEFT JOIN (
+        SELECT event_id, MAX(folder_path) AS folder_path
+        FROM sessions
+        WHERE deleted_at IS NULL AND event_id <> ''
+        GROUP BY event_id
+      ) AS session
+        ON session.event_id = event.id
+      WHERE event.deleted_at IS NULL
+      ORDER BY event.started_at, event.id
+    `,
+    mapRows: mapTimelineEventRows,
+  });
+
+  return timelineEventsTable;
+}
+
+export function useTimelineSessionsTable(): TimelineSessionsTable {
+  const timelineEventsTable = useTimelineEventsTable();
+  const { data: timelineSessionsTable = EMPTY_SESSIONS } = useLiveQuery<
+    TimelineSessionSqlRow,
+    Record<string, TimelineSessionRow>
+  >({
+    sql: `
+      SELECT
+        id,
+        title,
+        created_at,
+        event_id,
+        event_json,
+        folder_path AS folder_id,
+        locked,
+        COALESCE((
+          SELECT json_group_array(tags.name)
+          FROM session_tags
+          INNER JOIN tags
+            ON tags.id = session_tags.tag_id
+            AND tags.deleted_at IS NULL
+          WHERE session_tags.session_id = sessions.id
+            AND session_tags.deleted_at IS NULL
+        ), '[]') AS tags_json
+      FROM sessions
+      WHERE deleted_at IS NULL
+      ORDER BY created_at, id
+    `,
+    mapRows: mapTimelineSessionRows,
+  });
+  const pendingDeletions = useUndoDelete((state) => state.pendingDeletions);
+
+  // Sessions with a pending deletion are hidden optimistically, before the
+  // soft-delete write commits and the live query re-emits.
+  const sessions = useMemo(() => {
+    const pendingIds = Object.keys(pendingDeletions).filter(
+      (sessionId) => sessionId in timelineSessionsTable,
+    );
+    if (pendingIds.length === 0) return timelineSessionsTable;
+
+    const filtered = { ...timelineSessionsTable };
+    for (const sessionId of pendingIds) {
+      delete filtered[sessionId];
+    }
+    return filtered;
+  }, [timelineSessionsTable, pendingDeletions]);
+
+  return useMemo(() => {
+    if (!sessions || !timelineEventsTable) return sessions;
+    const tracked = new Map<string, { id: string; event: TimelineEventRow }>();
+    for (const [id, event] of Object.entries(timelineEventsTable)) {
+      if (!event.tracking_id_event) continue;
+      const key = JSON.stringify([
+        event.calendar_id ?? "",
+        event.tracking_id_event,
+      ]);
+      const previous = tracked.get(key);
+      const start = event.started_at ?? "";
+      const previousStart = previous?.event.started_at ?? "";
+      if (
+        !previous ||
+        start < previousStart ||
+        (start === previousStart && id < previous.id)
+      ) {
+        tracked.set(key, { id, event });
+      }
+    }
+    return Object.fromEntries(
+      Object.entries(sessions).map(([id, session]) => {
+        const saved = getSessionEvent(session);
+        const live =
+          timelineEventsTable[session.event_id ?? ""] ??
+          tracked.get(
+            JSON.stringify([saved?.calendar_id ?? "", saved?.tracking_id]),
+          )?.event;
+        return [
+          id,
+          live
+            ? {
+                ...session,
+                event_json: JSON.stringify({
+                  ...saved,
+                  tracking_id: live.tracking_id_event,
+                  calendar_id: live.calendar_id,
+                  started_at: live.started_at,
+                  ended_at: live.ended_at,
+                }),
+              }
+            : session,
+        ];
+      }),
+    );
+  }, [sessions, timelineEventsTable]);
+}
+
+export function useEnabledCalendarRows(): CalendarRow[] {
+  const { data = EMPTY_CALENDARS } = useLiveQuery<
+    CalendarSqlRow,
+    CalendarRow[]
+  >({
+    sql: `
+      SELECT
+        id,
+        tracking_id_calendar,
+        name,
+        enabled,
+        provider,
+        source,
+        color,
+        connection_id,
+        created_at
+      FROM calendars
+      WHERE enabled = 1 AND deleted_at IS NULL
+      ORDER BY name, id
+    `,
+    mapRows: (rows) => rows.map(normalizeCalendarRow),
+  });
+
+  return data;
+}
+
+export function useCalendarRows(provider?: string): CalendarRow[] {
+  const { data = EMPTY_CALENDARS } = useLiveQuery<
+    CalendarSqlRow,
+    CalendarRow[]
+  >({
+    sql: `
+      SELECT
+        id,
+        tracking_id_calendar,
+        name,
+        enabled,
+        provider,
+        source,
+        color,
+        connection_id,
+        created_at
+      FROM calendars
+      WHERE deleted_at IS NULL AND (? = '' OR provider = ?)
+      ORDER BY name, id
+    `,
+    params: [provider ?? "", provider ?? ""],
+    mapRows: (rows) => rows.map(normalizeCalendarRow),
+  });
+
+  return data;
+}
+
+export function setCalendarEnabled(
+  calendarId: string,
+  enabled: boolean,
+): Promise<void> {
+  return enqueueDatabaseWrite(`calendar-selection:${calendarId}`, async () => {
+    const result = await calendarCommands.setCalendarEnabled({
+      calendar_id: calendarId,
+      enabled,
+    });
+    if (result.status === "error") {
+      throw new Error(result.error);
+    }
+  });
+}
+
+export async function getCalendarEventStartedAt(
+  eventId: string,
+): Promise<string | null> {
+  const rows = await liveQueryClient.execute<CalendarEventStartSqlRow>(
+    `
+      SELECT started_at
+      FROM events
+      WHERE id = ? AND deleted_at IS NULL
+      LIMIT 1
+    `,
+    [eventId],
+  );
+  return rows[0]?.started_at || null;
+}
+
+export async function getCalendarEventMeetingLink(
+  eventId: string,
+): Promise<string | null> {
+  const rows = await liveQueryClient.execute<CalendarEventMeetingLinkSqlRow>(
+    `
+      SELECT meeting_link
+      FROM events
+      WHERE id = ? AND deleted_at IS NULL
+      LIMIT 1
+    `,
+    [eventId],
+  );
+  return rows[0]?.meeting_link.trim() || null;
+}
+
+export async function searchCalendarEvents(
+  query: string,
+  limit: number,
+): Promise<CalendarEventSearchResult[]> {
+  const normalizedQuery = query.trim().toLowerCase();
+  const rows = await liveQueryClient.execute<CalendarEventSearchSqlRow>(
+    `
+      SELECT
+        event.id,
+        event.title,
+        event.started_at,
+        event.ended_at,
+        event.location,
+        event.meeting_link,
+        event.description,
+        CASE
+          WHEN json_valid(event.participants_json)
+            AND json_type(event.participants_json) = 'array'
+          THEN json_array_length(event.participants_json)
+          ELSE 0
+        END AS participant_count,
+        COALESCE((
+          SELECT session.id
+          FROM sessions AS session
+          WHERE session.deleted_at IS NULL
+            AND (
+              session.event_id = event.id
+              OR (
+                event.tracking_id_event <> ''
+                AND session.external_event_id = event.tracking_id_event
+              )
+              OR (
+                json_valid(session.event_json)
+                AND json_extract(session.event_json, '$.tracking_id') =
+                  event.tracking_id_event
+                AND json_extract(session.event_json, '$.calendar_id') =
+                  event.calendar_id
+              )
+            )
+          ORDER BY session.created_at, session.id
+          LIMIT 1
+        ), '') AS linked_session_id
+      FROM events AS event
+      WHERE event.deleted_at IS NULL
+        AND (
+          ? = ''
+          OR instr(
+            lower(
+              event.title || char(10) ||
+              event.location || char(10) ||
+              event.meeting_link || char(10) ||
+              event.description
+            ),
+            ?
+          ) > 0
+        )
+      ORDER BY julianday(event.started_at) DESC, event.id
+      LIMIT ?
+    `,
+    [normalizedQuery, normalizedQuery, limit],
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title || "Untitled event",
+    startedAt: row.started_at || null,
+    endedAt: row.ended_at || null,
+    location: row.location || null,
+    meetingLink: row.meeting_link || null,
+    description: row.description || null,
+    participantCount: Number(row.participant_count) || 0,
+    linkedSessionId: row.linked_session_id || null,
+  }));
+}
+
+export async function getNearbyCalendarEvents(
+  nowMs: number,
+  windowMs: number,
+): Promise<NearbyCalendarEvent[]> {
+  const rows = await liveQueryClient.execute<NearbyCalendarEventSqlRow>(
+    `
+      SELECT
+        id,
+        title,
+        started_at,
+        meeting_link,
+        location,
+        description,
+        participants_json
+      FROM events
+      WHERE deleted_at IS NULL
+        AND is_all_day = 0
+        AND started_at <> ''
+        AND abs(
+          ((julianday(started_at) - 2440587.5) * 86400000) - ?
+        ) <= ?
+      ORDER BY abs(
+        ((julianday(started_at) - 2440587.5) * 86400000) - ?
+      ), julianday(started_at), id
+    `,
+    [nowMs, windowMs, nowMs],
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title || "Untitled Event",
+    meetingLink: row.meeting_link || undefined,
+    location: row.location || undefined,
+    description: row.description || undefined,
+    participantNames: [
+      ...new Set(
+        parseEventParticipants(row.participants_json ?? undefined)
+          .filter((participant) => participant.is_current_user !== true)
+          .map((participant) => participant.name?.trim() ?? "")
+          .filter(Boolean),
+      ),
+    ],
+  }));
+}
+
+export function useSessionEventParticipants(
+  sessionId: string,
+): EventParticipant[] {
+  return (
+    useSessionCalendarEvent(sessionId)?.participants ?? EMPTY_EVENT_PARTICIPANTS
+  );
+}
+
+export function useSessionCalendarEvent(
+  sessionId: string,
+  { enabled = true }: { enabled?: boolean } = {},
+): SessionCalendarEvent | null {
+  const { data = null } = useLiveQuery<
+    SessionCalendarEventSqlRow,
+    SessionCalendarEvent | null
+  >({
+    sql: `
+      SELECT
+        event.tracking_id_event AS tracking_id,
+        event.calendar_id,
+        event.title,
+        event.started_at,
+        event.ended_at,
+        event.is_all_day,
+        event.has_recurrence_rules,
+        event.recurrence_series_id,
+        event.location,
+        event.meeting_link,
+        event.description,
+        event.participants_json
+      FROM sessions AS session
+      JOIN events AS event
+        ON ${SESSION_EVENT_MATCH}
+      WHERE session.id = ? AND session.deleted_at IS NULL
+      ORDER BY ${SESSION_EVENT_ORDER}
+      LIMIT 1
+    `,
+    params: [sessionId],
+    enabled: enabled && Boolean(sessionId),
+    mapRows: (rows) => {
+      const row = rows[0];
+      return row
+        ? {
+            tracking_id: row.tracking_id,
+            calendar_id: row.calendar_id,
+            title: row.title,
+            started_at: row.started_at,
+            ended_at: row.ended_at,
+            is_all_day: Boolean(row.is_all_day),
+            has_recurrence_rules: Boolean(row.has_recurrence_rules),
+            recurrence_series_id: row.recurrence_series_id,
+            location: row.location,
+            meeting_link: row.meeting_link,
+            description: row.description,
+            participants: parseEventParticipants(row.participants_json),
+          }
+        : null;
+    },
+  });
+  return sessionId && enabled ? data : null;
+}
+
+export function mapTimelineEventRows(
+  rows: TimelineEventSqlRow[],
+): Record<string, TimelineEventRow> {
+  return Object.fromEntries(
+    rows.map(({ id, ...row }) => [
+      id,
+      {
+        ...row,
+        has_recurrence_rules: Boolean(row.has_recurrence_rules),
+        is_all_day: Boolean(row.is_all_day),
+      },
+    ]),
+  );
+}
+
+export function mapTimelineSessionRows(
+  rows: TimelineSessionSqlRow[],
+): Record<string, TimelineSessionRow> {
+  return Object.fromEntries(
+    rows.map(({ id, tags_json, ...row }) => [
+      id,
+      {
+        ...row,
+        tags: parseSessionTagNames(tags_json),
+      },
+    ]),
+  );
+}
+
+function normalizeCalendarRow(row: CalendarSqlRow): CalendarRow {
+  return { ...row, enabled: Boolean(row.enabled) };
+}
+
+export function parseEventParticipants(
+  value: string | undefined,
+): EventParticipant[] {
+  if (!value) return EMPTY_EVENT_PARTICIPANTS;
+
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.flatMap((participant) => {
+          const result = eventParticipantSchema.safeParse(participant);
+          return result.success ? [result.data] : [];
+        })
+      : EMPTY_EVENT_PARTICIPANTS;
+  } catch {
+    return EMPTY_EVENT_PARTICIPANTS;
+  }
+}

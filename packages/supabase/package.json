@@ -1,0 +1,35 @@
+{
+  "name": "@anlg/supabase",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./attachment-backups": "./src/attachment-backups.ts",
+    "./billing": "./src/billing.ts",
+    "./middleware": "./src/middleware.ts",
+    "./profile-avatar": "./src/profile-avatar.ts",
+    "./profile": "./src/profile.ts",
+    "./storage": "./src/storage.ts",
+    "./referrals": "./src/referrals.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.103.0",
+    "jose": "^6.2.2",
+    "tus-js-client": "^4.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.17",
+    "vitest": "^5.0.0"
+  },
+  "peerDependencies": {
+    "hono": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "hono": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}

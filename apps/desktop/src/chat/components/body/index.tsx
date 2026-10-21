@@ -1,0 +1,127 @@
+import { Trans } from "@lingui/react/macro";
+import type { ChatStatus } from "ai";
+
+import { CaretDown } from "@anlg/ui/components/icons";
+import { Button } from "@anlg/ui/components/ui/button";
+import { cn } from "@anlg/utils";
+
+import { ChatBodyEmpty } from "./empty";
+import { ChatBodyNonEmpty } from "./non-empty";
+import { useChatAutoScroll } from "./use-chat-auto-scroll";
+
+import type { ContextRef } from "~/chat/context/entities";
+import { chatFloatingControlClassNames } from "~/chat/surface";
+import type { AnlgUIMessage } from "~/chat/types";
+import { useShell } from "~/contexts/shell";
+
+export function ChatBody({
+  messages,
+  status,
+  error,
+  onReload,
+  isModelConfigured = true,
+  hasContext = false,
+  isLiveMeeting = false,
+  hasSummary = false,
+  onSendMessage,
+}: {
+  messages: AnlgUIMessage[];
+  status: ChatStatus;
+  error?: Error;
+  onReload?: () => void;
+  isModelConfigured?: boolean;
+  hasContext?: boolean;
+  isLiveMeeting?: boolean;
+  hasSummary?: boolean;
+  onSendMessage?: (
+    content: string,
+    parts: Array<{ type: "text"; text: string }>,
+    contextRefs?: ContextRef[],
+  ) => void;
+}) {
+  const { chat } = useShell();
+  const isRightPanel = chat.mode === "RightPanelOpen";
+  const isFloating = chat.mode === "FloatingOpen";
+  const {
+    contentRef,
+    isAtBottom,
+    scrollRef,
+    scrollToBottom,
+    showGoToRecent,
+    updateAutoScrollState,
+    handleKeyDown,
+    handlePointerDown,
+    handlePointerMove,
+    handleWheel,
+  } = useChatAutoScroll(status);
+
+  return (
+    <div
+      className={cn([
+        "relative flex min-h-0 flex-col",
+        isRightPanel ? "flex-1" : "flex-auto",
+      ])}
+    >
+      <div
+        ref={scrollRef}
+        onKeyDown={handleKeyDown}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onScroll={updateAutoScrollState}
+        onWheel={handleWheel}
+        className={cn([
+          "flex min-h-0 flex-col overflow-y-auto",
+          isRightPanel ? "flex-1" : "max-h-[min(36rem,70vh)] flex-auto",
+        ])}
+      >
+        <div
+          ref={contentRef}
+          className={cn([
+            "flex flex-col",
+            isRightPanel && "min-h-full flex-1",
+            isRightPanel ? "px-3 py-5" : "px-5 py-3",
+          ])}
+        >
+          {!isFloating && <div className="flex-1" />}
+          {messages.length === 0 ? (
+            <ChatBodyEmpty
+              isModelConfigured={isModelConfigured}
+              hasContext={hasContext}
+              isLiveMeeting={isLiveMeeting}
+              hasSummary={hasSummary}
+              onSendMessage={onSendMessage}
+            />
+          ) : (
+            <ChatBodyNonEmpty
+              messages={messages}
+              status={status}
+              error={error}
+              onReload={onReload}
+            />
+          )}
+        </div>
+      </div>
+      {messages.length > 0 && showGoToRecent && !isAtBottom && (
+        <div
+          data-chat-go-to-recent-anchor
+          className="absolute bottom-3 left-1/2 z-20 -translate-x-1/2"
+        >
+          <Button
+            onClick={scrollToBottom}
+            size="sm"
+            className={cn([
+              "flex items-center gap-1 rounded-full border shadow-xs",
+              chatFloatingControlClassNames(),
+            ])}
+            variant="outline"
+          >
+            <CaretDown size={12} />
+            <span className="text-xs">
+              <Trans>Go to recent</Trans>
+            </span>
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,291 @@
+import { tool } from "ai";
+import { z } from "zod";
+
+import { resolveFolderPaths, type ToolCallOptions } from "./current-session";
+import { searchMeetingContent } from "./note-files";
+import type { ToolDependencies } from "./types";
+
+import type { SearchFilters } from "~/search/contexts/engine/types";
+import { loadSessionSummariesByFolder } from "~/session/queries";
+import { sessionSearchTimestamp } from "~/session/utils";
+
+const gteSchema = z
+  .number()
+  .optional()
+  .describe("Include meetings on or after this Unix timestamp in milliseconds");
+const lteSchema = z
+  .number()
+  .optional()
+  .describe(
+    "Include meetings on or before this Unix timestamp in milliseconds",
+  );
+const gtSchema = z
+  .number()
+  .optional()
+  .describe("Include meetings after this Unix timestamp in milliseconds");
+const ltSchema = z
+  .number()
+  .optional()
+  .describe("Include meetings before this Unix timestamp in milliseconds");
+const eqSchema = z
+  .number()
+  .optional()
+  .describe(
+    "Include only meetings at this exact Unix timestamp in milliseconds",
+  );
+
+const absoluteCreatedAtFilterSchema = z
+  .object({
+    kind: z.literal("absolute"),
+    gte: gteSchema,
+    lte: lteSchema,
+    gt: gtSchema,
+    lt: ltSchema,
+    eq: eqSchema,
+  })
+  .describe(
+    "Absolute timestamp bounds using Unix milliseconds. Use this only when you already know the exact timestamps.",
+  );
+
+const relativeCreatedAtFilterSchema = z
+  .object({
+    kind: z.literal("relative"),
+    recent_days: z
+      .number()
+      .int()
+      .min(1)
+      .max(365)
+      .describe(
+        "Use for requests like 'last N days'. Includes today and counts backward in local time.",
+      ),
+  })
+  .describe(
+    "Relative date filter. Prefer this over absolute timestamps for natural-language time ranges.",
+  );
+
+const createdAtFilterSchema = z
+  .union([absoluteCreatedAtFilterSchema, relativeCreatedAtFilterSchema])
+  .describe(
+    "Date filter for meetings. Uses event started_at for event-backed meetings, otherwise meeting created_at.",
+  );
+
+const searchMeetingsFiltersSchema = z
+  .object({
+    created_at: createdAtFilterSchema.optional(),
+  })
+  .optional()
+  .describe("Optional meeting filters");
+
+type AbsoluteCreatedAtFilter = z.infer<typeof absoluteCreatedAtFilterSchema>;
+type SearchMeetingsFiltersInput = z.infer<typeof searchMeetingsFiltersSchema>;
+
+function sessionMatchesCreatedAt(
+  timestamp: number,
+  filter: SearchFilters["created_at"],
+): boolean {
+  if (!filter) {
+    return true;
+  }
+
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return false;
+  }
+
+  if (filter.eq !== undefined && timestamp !== filter.eq) {
+    return false;
+  }
+  if (filter.gte !== undefined && timestamp < filter.gte) {
+    return false;
+  }
+  if (filter.lte !== undefined && timestamp > filter.lte) {
+    return false;
+  }
+  if (filter.gt !== undefined && timestamp <= filter.gt) {
+    return false;
+  }
+  if (filter.lt !== undefined && timestamp >= filter.lt) {
+    return false;
+  }
+
+  return true;
+}
+
+async function searchFolderMeetings({
+  query,
+  folderFilter,
+  createdAt,
+  limit,
+}: {
+  query: string;
+  folderFilter: string;
+  createdAt: SearchFilters["created_at"];
+  limit: number;
+}): Promise<{
+  results: Array<{
+    id: string;
+    title: string;
+    excerpt: string;
+    score: number;
+    created_at: number;
+  }>;
+}> {
+  const sessions = (await loadSessionSummariesByFolder(folderFilter))
+    .map((session) => ({
+      ...session,
+      searchAt: sessionSearchTimestamp(session.event_json, session.created_at),
+    }))
+    .filter((session) => sessionMatchesCreatedAt(session.searchAt, createdAt));
+
+  if (sessions.length === 0) {
+    return { results: [] };
+  }
+
+  if (!query.trim()) {
+    return {
+      results: sessions.slice(0, limit).map((session) => ({
+        id: session.id,
+        title: session.title,
+        excerpt: "",
+        score: 0,
+        created_at: session.searchAt,
+      })),
+    };
+  }
+
+  const content = await searchMeetingContent({
+    query,
+    sessionIds: sessions.map((session) => session.id),
+    limit,
+  });
+  const createdAtById = new Map(
+    sessions.map((session) => [session.id, session.searchAt]),
+  );
+
+  return {
+    results: content.results.map((match) => ({
+      id: match.sessionId,
+      title: match.title,
+      excerpt: match.snippets[0]?.text ?? "",
+      score: match.score,
+      created_at: createdAtById.get(match.sessionId) ?? 0,
+    })),
+  };
+}
+
+function getRecentDaysFilter(
+  days: number,
+): NonNullable<SearchFilters["created_at"]> {
+  const now = new Date();
+  const startOfToday = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime();
+  const endOfToday = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+    23,
+    59,
+    59,
+    999,
+  ).getTime();
+
+  return {
+    gte: startOfToday - Math.max(days - 1, 0) * 24 * 60 * 60 * 1000,
+    lte: endOfToday,
+  };
+}
+
+export const buildSearchMeetingsTool = (deps: ToolDependencies) =>
+  tool({
+    description: `
+Search for meetings using note and transcript content plus optional date filters.
+Use this first for open-ended questions about past meetings, people, decisions, or topics when the answer may be in meeting notes and no meeting note context is attached.
+Use filters.created_at.kind="relative" with recent_days for natural-language date ranges.
+Use an empty query string when the user only wants meetings by date/time filter.
+Returns relevant meetings with matching content excerpts.
+`.trim(),
+    inputSchema: z.object({
+      query: z
+        .string()
+        .optional()
+        .describe(
+          "Optional text query for finding relevant meetings. Omit this when filtering only by date/time.",
+        ),
+      filters: searchMeetingsFiltersSchema,
+      limit: z
+        .number()
+        .int()
+        .min(0)
+        .max(10)
+        .optional()
+        .describe("Maximum number of meetings to return"),
+    }),
+    execute: async (
+      params: {
+        query?: string;
+        filters?: SearchMeetingsFiltersInput;
+        limit?: number;
+      },
+      options?: ToolCallOptions,
+    ) => {
+      const query = params.query ?? "";
+      const createdAtFilter = params.filters?.created_at;
+      const effectiveFilters: SearchFilters | null = createdAtFilter
+        ? {
+            created_at:
+              createdAtFilter.kind === "absolute"
+                ? (({ gte, lte, gt, lt, eq }: AbsoluteCreatedAtFilter) => ({
+                    gte,
+                    lte,
+                    gt,
+                    lt,
+                    eq,
+                  }))(createdAtFilter)
+                : getRecentDaysFilter(createdAtFilter.recent_days),
+          }
+        : null;
+
+      const folderPaths = resolveFolderPaths(deps, options);
+      const limit = params.limit ?? 5;
+
+      if (folderPaths.length > 0) {
+        const perFolder = await Promise.all(
+          folderPaths.map((folderFilter) =>
+            searchFolderMeetings({
+              query,
+              folderFilter,
+              createdAt: effectiveFilters?.created_at,
+              limit,
+            }),
+          ),
+        );
+        const seenIds = new Set<string>();
+        const results = perFolder
+          .flatMap((page) => page.results)
+          .sort((a, b) => b.score - a.score || b.created_at - a.created_at)
+          .filter((result) => {
+            if (seenIds.has(result.id)) {
+              return false;
+            }
+            seenIds.add(result.id);
+            return true;
+          })
+          .slice(0, limit);
+        return { results };
+      }
+
+      const hits = await deps.search(query, effectiveFilters);
+      const meetingHits = hits.filter((hit) => hit.document.type === "session");
+      const results = meetingHits.slice(0, limit).map((hit) => ({
+        id: hit.document.id,
+        title: hit.document.title,
+        excerpt: hit.document.content.slice(0, 180),
+        score: hit.score,
+        created_at: hit.document.created_at,
+      }));
+
+      return { results };
+    },
+  });

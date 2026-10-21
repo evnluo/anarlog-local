@@ -1,0 +1,172 @@
+name: macOS Apple Silicon
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  ANARLOG_DISABLE_SENTRY: "1"
+
+jobs:
+  test-and-build:
+    name: test + build aarch64 app/dmg
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: aarch64-apple-darwin
+          components: rustfmt,clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+          cache-on-failure: "true"
+          shared-key: macos-arm64
+
+      - name: Install Metal toolchain when required
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_major=$(xcodebuild -version | ruby -ne 'puts $1 if $_ =~ /Xcode (\d+)/')
+          if [[ "$xcode_major" -ge 26 ]]; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared UI
+        run: pnpm --filter @anlg/ui build
+
+      - name: Verify formatting
+        run: pnpm fmt:check
+
+      - name: Type-check desktop
+        run: pnpm --filter @anlg/desktop typecheck
+
+      - name: Test local edition boundaries and dictation
+        run: >-
+          pnpm --filter @anlg/desktop exec vitest run
+          src/local-edition.test.ts
+          src/local-edition-config.test.ts
+          src/provider-boundary.test.tsx
+          src/ai/hooks/useLLMConnection.test.ts
+          src/chat/tools/index.test.ts
+          src/dictation/lifecycle.test.tsx
+          src/onboarding/welcome-note.test.ts
+          src/settings/general/app-settings.test.tsx
+          src/settings/dictionary/index.test.tsx
+          src/sidebar/index.test.tsx
+          src/automations/engine.test.ts
+
+      - name: Test independent storage boundaries
+        run: cargo test --locked -p storage -p tauri-plugin-tracing
+
+      - name: Compile permission helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p apps/desktop/src-tauri/binaries
+          swiftc plugins/permissions/swift/check-permissions.swift \
+            -o apps/desktop/src-tauri/binaries/check-permissions-aarch64-apple-darwin
+
+      - name: Build native Apple Silicon app
+        env:
+          CI: "false"
+          APPLE_SIGNING_IDENTITY: "-"
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: >-
+          pnpm --filter @anlg/desktop tauri build
+          --target aarch64-apple-darwin
+          --bundles app
+          --verbose
+
+      - name: Ad-hoc sign, inspect, and smoke-launch
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          app_candidates=(apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app)
+          if [[ ${#app_candidates[@]} -ne 1 ]]; then
+            echo "Expected one .app, found ${#app_candidates[@]}" >&2
+            exit 1
+          fi
+          app="${app_candidates[0]}"
+          binary="$app/Contents/MacOS/anarlog-local"
+          [[ -x "$binary" ]]
+
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" = "com.evnluo.anarlog-local"
+          test "$(plutil -extract CFBundleName raw -o - "$app/Contents/Info.plist")" = "Anarlog Local"
+          lipo -archs "$binary" | grep -Eq '(^| )arm64( |$)'
+
+          "$binary" --background > "$RUNNER_TEMP/anarlog-local-smoke.log" 2>&1 &
+          app_pid=$!
+          sleep 15
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            cat "$RUNNER_TEMP/anarlog-local-smoke.log"
+            echo "Anarlog Local exited during startup smoke test" >&2
+            exit 1
+          fi
+          kill "$app_pid"
+          wait "$app_pid" || true
+
+          dmg_dir="apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg"
+          rm -f "$dmg_dir"/*.dmg
+          mkdir -p "$dmg_dir"
+          dmg="$dmg_dir/Anarlog_Local_aarch64.dmg"
+          hdiutil create -volname "Anarlog Local" -srcfolder "$app" -ov -format UDZO "$dmg"
+
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$app" dist/Anarlog_Local_aarch64.app.zip
+          cp "$dmg" dist/
+          cp LICENSE LICENSING.md UPSTREAM.md CAPABILITIES.md THIRD_PARTY_NOTICES.md dist/
+          cp licenses/*.txt dist/
+          (cd dist && shasum -a 256 Anarlog_Local_aarch64.dmg Anarlog_Local_aarch64.app.zip > SHA256SUMS.txt)
+          codesign -dv --verbose=4 "$app" 2>&1 | tee dist/CODESIGN.txt
+          file "$binary" | tee dist/ARCHITECTURE.txt
+
+      - name: Upload verified macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: anarlog-local-macos-aarch64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

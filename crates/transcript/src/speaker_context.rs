@@ -1,0 +1,345 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::{ChannelProfile, RenderTranscriptHuman, RenderedTranscriptSegment};
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct SpeakerContext {
+    pub intervals: Vec<SpeakerContextInterval>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct SpeakerContextInterval {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub active_call: bool,
+    pub calendar_call: bool,
+    pub mic_isolated: Option<bool>,
+    pub shared_microphone: bool,
+    pub title: String,
+    pub self_names: Vec<String>,
+    pub participants: Vec<RenderTranscriptHuman>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerResolutionReason {
+    PersonalMicrophone,
+    VirtualMeetingMicrophone,
+    SoleRemoteParticipant,
+    OneOnOneTitle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct ProvisionalSpeakerLabel {
+    pub name: String,
+    pub human_id: Option<String>,
+    pub reason: SpeakerResolutionReason,
+}
+
+pub fn segment_options_for_assignments(
+    assignments: &[crate::IdentityAssignment],
+) -> crate::SegmentBuilderOptions {
+    crate::SegmentBuilderOptions {
+        complete_channels: Some(
+            assignments
+                .iter()
+                .filter_map(|assignment| match assignment.scope {
+                    crate::IdentityScope::Channel { channel } => Some(channel),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        min_segment_words: Some(0),
+        min_segment_ms: Some(0),
+        ..Default::default()
+    }
+}
+
+impl SpeakerContext {
+    fn interval_at(&self, start_ms: i64, end_ms: i64) -> Option<usize> {
+        let mut matches = self.intervals.iter().enumerate().filter(|(_, interval)| {
+            interval.start_ms <= start_ms
+                && end_ms <= interval.end_ms
+                && interval.start_ms < interval.end_ms
+        });
+        if let Some((index, _)) = matches.next() {
+            return matches.next().is_none().then_some(index);
+        }
+        self.isolated_run_at(start_ms, end_ms)
+    }
+
+    // Call-evidence changes split context intervals even while `mic_isolated`
+    // stays true on both sides, so adjacent isolated intervals form one
+    // verified isolated period; a word straddling that seam still belongs to
+    // the run's first interval.
+    fn isolated_run_at(&self, start_ms: i64, end_ms: i64) -> Option<usize> {
+        let mut run: Option<(usize, i64, i64)> = None;
+        for (index, interval) in self.intervals.iter().enumerate() {
+            if interval.mic_isolated != Some(true) {
+                continue;
+            }
+            match &mut run {
+                Some((_, _, run_end)) if interval.start_ms <= *run_end => {
+                    *run_end = (*run_end).max(interval.end_ms);
+                }
+                _ => run = Some((index, interval.start_ms, interval.end_ms)),
+            }
+            if let Some((first, run_start, run_end)) = run
+                && run_start <= start_ms
+                && end_ms <= run_end
+                && run_start < run_end
+            {
+                return Some(first);
+            }
+        }
+        None
+    }
+
+    pub fn label_segments(
+        &self,
+        segments: Vec<RenderedTranscriptSegment>,
+        started_at: i64,
+        self_human_id: Option<&str>,
+        humans: &[RenderTranscriptHuman],
+    ) -> Vec<RenderedTranscriptSegment> {
+        // Mic words per diarization voice per interval. Remote voices are not counted: diarization
+        // indices restart with every stream refresh, so their number says nothing about how
+        // many people are on the far end of a call.
+        let mut local_voices = vec![HashMap::<Option<i32>, usize>::new(); self.intervals.len()];
+        for segment in &segments {
+            if segment.key.channel != ChannelProfile::DirectMic {
+                continue;
+            }
+            for word in &segment.words {
+                if let Some(index) = self.interval_at(
+                    started_at.saturating_add(word.start_ms),
+                    started_at.saturating_add(word.end_ms),
+                ) {
+                    *local_voices[index]
+                        .entry(segment.key.speaker_index)
+                        .or_default() += 1;
+                }
+            }
+        }
+
+        let mut result = Vec::new();
+        for segment in segments {
+            // Context boundaries only affect inferred names, not explicit assignments.
+            if segment.key.speaker_human_id.is_some() {
+                result.push(RenderedTranscriptSegment {
+                    provisional_speaker: None,
+                    ..segment
+                });
+                continue;
+            }
+
+            let mut groups: Vec<(Option<usize>, Vec<crate::SegmentWord>)> = Vec::new();
+            for word in &segment.words {
+                let interval = self.interval_at(
+                    started_at.saturating_add(word.start_ms),
+                    started_at.saturating_add(word.end_ms),
+                );
+                if let Some((last_interval, words)) = groups.last_mut()
+                    && *last_interval == interval
+                {
+                    words.push(word.clone());
+                } else {
+                    groups.push((interval, vec![word.clone()]));
+                }
+            }
+            let split = groups.len() > 1;
+            for (interval, words) in groups {
+                let mut part = RenderedTranscriptSegment {
+                    id: segment.id.clone(),
+                    key: segment.key.clone(),
+                    speaker_label: segment.speaker_label.clone(),
+                    provisional_speaker: None,
+                    start_ms: words[0].start_ms,
+                    end_ms: words.last().unwrap().end_ms,
+                    text: String::new(),
+                    words: Vec::new(),
+                };
+                if split {
+                    part.id = format!("{}:{}", part.id, part.start_ms);
+                }
+                part.text = words
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect::<String>()
+                    .trim()
+                    .to_owned();
+                part.words = words;
+                part.provisional_speaker = None;
+                if part.key.speaker_human_id.is_none()
+                    && let Some(index) = interval
+                {
+                    part.provisional_speaker = resolve_speaker(
+                        &self.intervals[index],
+                        part.key.channel,
+                        is_owner_voice(&local_voices[index], part.key.speaker_index),
+                        self_human_id,
+                        humans,
+                    );
+                }
+                if let Some(label) = &part.provisional_speaker {
+                    part.speaker_label = label.name.clone();
+                }
+                result.push(part);
+            }
+        }
+
+        // Provisional names do not consume anonymous speaker numbers or become identity hints.
+        let mut unknown = std::collections::HashMap::new();
+        for segment in &mut result {
+            if segment.key.speaker_human_id.is_none() && segment.provisional_speaker.is_none() {
+                let next = unknown.len() + 1;
+                let number = unknown
+                    .entry((segment.key.channel, segment.key.speaker_index))
+                    .or_insert(next);
+                segment.speaker_label = format!("Speaker {number}");
+            }
+        }
+        result
+    }
+}
+
+// A room mic on a call also catches nearby chatter and diarization splits of the owner's own
+// voice, so the voice carrying at least this share of the interval's mic words is the owner.
+const OWNER_VOICE_SHARE_PERCENT: usize = 80;
+
+fn is_owner_voice(voices: &HashMap<Option<i32>, usize>, speaker_index: Option<i32>) -> bool {
+    if voices.len() <= 1 {
+        return true;
+    }
+    // Unindexed words carry no voice identity once diarized voices are present.
+    if speaker_index.is_none() {
+        return false;
+    }
+    let total: usize = voices.values().sum();
+    voices
+        .get(&speaker_index)
+        .is_some_and(|count| count * 100 >= total * OWNER_VOICE_SHARE_PERCENT)
+}
+
+fn resolve_speaker(
+    context: &SpeakerContextInterval,
+    source: ChannelProfile,
+    owner_voice: bool,
+    self_id: Option<&str>,
+    humans: &[RenderTranscriptHuman],
+) -> Option<ProvisionalSpeakerLabel> {
+    let self_id = self_id.filter(|id| !id.trim().is_empty())?;
+    let virtual_call = context.active_call || context.calendar_call;
+    // A headset only hears its wearer however diarization splits the voice; a room microphone
+    // on a call is the owner only for the voice that dominates it.
+    let personal_microphone = context.mic_isolated == Some(true);
+    match source {
+        ChannelProfile::DirectMic
+            if !context.shared_microphone
+                && (personal_microphone || (virtual_call && owner_voice)) =>
+        {
+            let name = humans
+                .iter()
+                .find(|human| human.human_id == self_id)
+                .map(|human| human.name.trim())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("You");
+            Some(ProvisionalSpeakerLabel {
+                name: name.to_owned(),
+                human_id: Some(self_id.to_owned()),
+                reason: if personal_microphone {
+                    SpeakerResolutionReason::PersonalMicrophone
+                } else {
+                    SpeakerResolutionReason::VirtualMeetingMicrophone
+                },
+            })
+        }
+        // The far end of a call is whoever else was invited, regardless of how many voices
+        // diarization reports for it.
+        ChannelProfile::RemoteParty if virtual_call => {
+            let remotes = context
+                .participants
+                .iter()
+                .filter(|person| !person.human_id.is_empty() && person.human_id != self_id)
+                .map(|person| person.human_id.as_str())
+                .collect::<HashSet<_>>();
+            if remotes.len() == 1 {
+                let person = context
+                    .participants
+                    .iter()
+                    .find(|person| remotes.contains(person.human_id.as_str()))?;
+                if !person.name.trim().is_empty() {
+                    return Some(ProvisionalSpeakerLabel {
+                        name: person.name.trim().to_owned(),
+                        human_id: Some(person.human_id.clone()),
+                        reason: SpeakerResolutionReason::SoleRemoteParticipant,
+                    });
+                }
+            }
+            if !remotes.is_empty() {
+                return None;
+            }
+            remote_name_from_title(&context.title, &context.self_names).map(|name| {
+                ProvisionalSpeakerLabel {
+                    name,
+                    human_id: None,
+                    reason: SpeakerResolutionReason::OneOnOneTitle,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn remote_name_from_title(title: &str, self_names: &[String]) -> Option<String> {
+    let title = title
+        .trim()
+        .trim_matches(|c| matches!(c, '[' | ']' | '(' | ')' | '{' | '}' | '【' | '】'));
+    let mut normalized = title.replace(['🤝', '×', '/', '&', '+', '|', '·', '、', '↔'], " x ");
+    for separator in ["<->", "<>", "][", "] [", ")(", ") ("] {
+        normalized = normalized.replace(separator, " x ");
+    }
+    let names = if normalized.contains(" x ") || normalized.contains(" X ") {
+        normalized
+            .split(" x ")
+            .flat_map(|part| part.split(" X "))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+    } else {
+        // Unseparated Korean first-name pairs are common; arbitrary multi-word titles are not names.
+        let words = title.split_whitespace().collect::<Vec<_>>();
+        if words.len() != 2
+            || !words.iter().all(|word| {
+                (2..=4).contains(&word.chars().count())
+                    && word.chars().all(|c| ('가'..='힣').contains(&c))
+            })
+        {
+            return None;
+        }
+        words
+    };
+    if names.len() != 2
+        || names.iter().any(|name| {
+            name.is_empty()
+                || name.chars().count() > 60
+                || !name
+                    .chars()
+                    .all(|c| c.is_alphabetic() || matches!(c, ' ' | '-' | '\'' | '.'))
+        })
+    {
+        return None;
+    }
+    let is_self = |name: &str| {
+        self_names.iter().any(|alias| {
+            !alias.trim().is_empty() && alias.trim().to_lowercase() == name.to_lowercase()
+        })
+    };
+    match (is_self(names[0]), is_self(names[1])) {
+        (true, false) => Some(names[1].to_owned()),
+        (false, true) => Some(names[0].to_owned()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests;

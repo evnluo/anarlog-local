@@ -1,0 +1,32 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build": {
+      "outputs": ["dist/**", ".output/**"]
+    },
+    "typecheck": {
+      "dependsOn": ["^typecheck"]
+    },
+    "test": {},
+    "dev": {
+      "persistent": true,
+      "cache": false
+    },
+    "//#dev:desktop": {
+      "passThroughEnv": ["CARGO_TARGET_DIR"],
+      "persistent": true,
+      "cache": false
+    },
+    "//#dev:web": {
+      "persistent": true,
+      "cache": false
+    },
+    "tauri:dev": {
+      "persistent": true,
+      "cache": false
+    },
+    "tauri:build": {
+      "cache": false
+    }
+  }
+}

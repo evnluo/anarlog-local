@@ -1,0 +1,178 @@
+import { collectFolderPaths, folderPathMatchesFilter } from "../folders";
+import type { SessionSummaryRecord } from "./types";
+
+import { liveQueryClient, useLiveQuery } from "~/db";
+import { normalizeFolderIcon } from "~/session/folder-icon";
+import { type TemplateIcon } from "~/templates/template-icon";
+
+type FolderPathSqlRow = {
+  folder_path: string;
+};
+
+const EMPTY_FOLDER_PATHS: string[] = [];
+
+export const FOLDER_PATHS_SQL = `
+  SELECT folder_path
+  FROM (
+    SELECT folder_path
+    FROM sessions
+    WHERE deleted_at IS NULL
+      AND folder_path != ''
+    UNION
+    SELECT folder_path
+    FROM folder_attachments
+    WHERE deleted_at IS NULL
+      AND folder_path != ''
+    UNION
+    SELECT path AS folder_path
+    FROM folders
+    WHERE deleted_at IS NULL
+      AND path != ''
+  )
+`;
+
+function mapFolderPathRows(rows: FolderPathSqlRow[]): string[] {
+  return collectFolderPaths(rows.map((row) => row.folder_path));
+}
+
+export function useFolderPaths(): string[] {
+  const { data = EMPTY_FOLDER_PATHS } = useLiveQuery<
+    FolderPathSqlRow,
+    string[]
+  >({
+    sql: FOLDER_PATHS_SQL,
+    mapRows: mapFolderPathRows,
+  });
+  return data;
+}
+
+export async function loadFolderPaths(): Promise<string[]> {
+  const rows =
+    await liveQueryClient.execute<FolderPathSqlRow>(FOLDER_PATHS_SQL);
+  return mapFolderPathRows(rows);
+}
+
+type FolderIconSqlRow = {
+  path: string;
+  icon_json?: unknown;
+  iconJson?: unknown;
+};
+
+const EMPTY_FOLDER_ICONS: Record<string, TemplateIcon> = {};
+
+export function useFolderIcons(): Record<string, TemplateIcon> {
+  const { data = EMPTY_FOLDER_ICONS } = useLiveQuery<
+    FolderIconSqlRow,
+    Record<string, TemplateIcon>
+  >({
+    sql: `
+      SELECT path, icon_json
+      FROM folders
+      WHERE deleted_at IS NULL
+        AND path != ''
+    `,
+    mapRows: (rows) => {
+      const icons: Record<string, TemplateIcon> = {};
+      for (const row of rows) {
+        icons[row.path] = normalizeFolderIcon(row.icon_json ?? row.iconJson);
+      }
+      return icons;
+    },
+  });
+  return data;
+}
+
+type FolderWorkspaceSqlRow = {
+  path: string;
+  workspace_id: string;
+  name: string;
+};
+
+export type FolderWorkspace = {
+  workspaceId: string;
+  name: string;
+};
+
+const EMPTY_FOLDER_WORKSPACES: Record<string, FolderWorkspace> = {};
+
+export const FOLDER_WORKSPACES_SQL = `
+  SELECT folder.path, folder.workspace_id, workspace.name
+  FROM folders AS folder
+  JOIN workspaces AS workspace
+    ON workspace.id = folder.workspace_id
+    AND workspace.kind = 'shared'
+    AND workspace.deleted_at IS NULL
+  WHERE folder.deleted_at IS NULL
+    AND folder.workspace_id <> ''
+`;
+
+export function useFolderWorkspaces(): Record<string, FolderWorkspace> {
+  const { data = EMPTY_FOLDER_WORKSPACES } = useLiveQuery<
+    FolderWorkspaceSqlRow,
+    Record<string, FolderWorkspace>
+  >({
+    sql: FOLDER_WORKSPACES_SQL,
+    mapRows: (rows) => {
+      const workspaces: Record<string, FolderWorkspace> = {};
+      for (const row of rows) {
+        workspaces[row.path] = {
+          workspaceId: row.workspace_id,
+          name: row.name,
+        };
+      }
+      return workspaces;
+    },
+  });
+  return data;
+}
+
+type FolderSessionSqlRow = {
+  id: string;
+  title: string;
+  created_at: string;
+  event_json: string;
+  folder_path: string;
+};
+
+export type FolderSessionSummary = SessionSummaryRecord & {
+  event_json: string;
+};
+
+function folderSessionFilterSql(folderFilter: string): {
+  sql: string;
+  params: string[];
+} {
+  if (folderFilter === "") {
+    return { sql: "folder_path = ''", params: [] };
+  }
+
+  return {
+    sql: "(folder_path = ? OR folder_path LIKE ? OR folder_path LIKE ?)",
+    params: [folderFilter, `${folderFilter}/%`, `${folderFilter}\\%`],
+  };
+}
+
+export async function loadSessionSummariesByFolder(
+  folderFilter: string,
+): Promise<FolderSessionSummary[]> {
+  const { sql, params } = folderSessionFilterSql(folderFilter);
+  const rows = await liveQueryClient.execute<FolderSessionSqlRow>(
+    `
+      SELECT id, title, created_at, event_json, folder_path
+      FROM sessions
+      WHERE deleted_at IS NULL
+        AND ${sql}
+      ORDER BY created_at DESC
+    `,
+    params,
+  );
+
+  return rows
+    .filter((row) => folderPathMatchesFilter(row.folder_path, folderFilter))
+    .map((row) => ({
+      id: row.id,
+      title: row.title,
+      created_at: row.created_at,
+      event_json: row.event_json,
+    }));
+}

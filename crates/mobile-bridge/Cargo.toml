@@ -1,0 +1,44 @@
+[package]
+name = "mobile-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "mobile_bridge"
+
+[dependencies]
+anlg-attachment-sync-core = { workspace = true }
+anlg-db-app = { workspace = true }
+anlg-db-core = { workspace = true }
+anlg-db-execute = { workspace = true }
+anlg-db-migrate = { workspace = true }
+anlg-db-reactive = { workspace = true }
+anlg-db-sync = { workspace = true }
+anlg-e2ee = { workspace = true }
+owhisper-client = { workspace = true }
+owhisper-interface = { workspace = true }
+
+bytes = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+uniffi = { version = "0.31", features = ["tokio"] }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+rustls-platform-verifier = "0.6"
+
+[dev-dependencies]
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }

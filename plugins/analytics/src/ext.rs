@@ -1,0 +1,286 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
+
+use tauri_plugin_misc::MiscPluginExt;
+use tauri_plugin_store2::Store2PluginExt;
+
+static REPORTED_QUEUE_FULL: AtomicBool = AtomicBool::new(false);
+static REPORTED_DELIVERY_FAILURE: AtomicBool = AtomicBool::new(false);
+static LEGACY_ID_MERGE_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+fn report_delivery_problem_once(reported: &AtomicBool, event: &'static str) {
+    if !reported.swap(true, Ordering::Relaxed) {
+        tracing::event!(tracing::Level::ERROR, message = event);
+    }
+}
+
+pub struct Analytics<'a, R: tauri::Runtime, M: tauri::Manager<R>> {
+    manager: &'a M,
+    _runtime: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<'a, R: tauri::Runtime, M: tauri::Manager<R>> Analytics<'a, R, M> {
+    pub async fn event(
+        &self,
+        mut payload: anlg_analytics::AnalyticsPayload,
+    ) -> Result<(), crate::Error> {
+        if self.is_disabled().unwrap_or(true) {
+            return Ok(());
+        }
+
+        Self::enrich_payload(self.manager, &mut payload);
+        self.alias_legacy_distinct_id().await;
+
+        let machine_id = anlg_host::fingerprint();
+        let state = self.manager.state::<crate::ManagedState>();
+        state
+            .client
+            .event(machine_id, payload)
+            .await
+            .map_err(crate::Error::AnlgAnalytics)?;
+
+        Ok(())
+    }
+
+    fn legacy_distinct_id_aliased(&self) -> bool {
+        self.manager
+            .store2()
+            .scoped_store(crate::PLUGIN_NAME)
+            .and_then(|store| Ok(store.get(crate::StoreKey::LegacyDistinctIdAliased)?))
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    }
+
+    async fn alias_legacy_distinct_id(&self) {
+        if self.legacy_distinct_id_aliased() {
+            return;
+        }
+
+        let client = self.manager.state::<crate::ManagedState>().client.clone();
+        let app_handle = self.manager.app_handle().clone();
+        Self::alias_legacy_distinct_id_with(client, app_handle).await;
+    }
+
+    async fn alias_legacy_distinct_id_with(
+        client: anlg_analytics::AnalyticsClient,
+        app_handle: tauri::AppHandle<R>,
+    ) {
+        if LEGACY_ID_MERGE_CLAIMED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let machine_id = anlg_host::fingerprint();
+        let legacy_id = anlg_analytics::legacy_pseudonymous_device_id(&machine_id);
+        if let Err(error) = client.merge_distinct_ids(machine_id, legacy_id).await {
+            LEGACY_ID_MERGE_CLAIMED.store(false, Ordering::Release);
+            tracing::warn!(%error, "legacy analytics id merge delivery failed");
+            return;
+        }
+
+        let stored = app_handle
+            .store2()
+            .scoped_store(crate::PLUGIN_NAME)
+            .and_then(|store| Ok(store.set(crate::StoreKey::LegacyDistinctIdAliased, true)?));
+        if let Err(error) = stored {
+            tracing::warn!(%error, "failed to persist legacy analytics alias marker");
+        }
+    }
+
+    pub fn event_fire_and_forget(&self, mut payload: anlg_analytics::AnalyticsPayload) {
+        if self.is_disabled().unwrap_or(true) {
+            return;
+        }
+
+        let state = self.manager.state::<crate::ManagedState>();
+        let Ok(permit) = state.fire_and_forget_slots.clone().try_acquire_owned() else {
+            report_delivery_problem_once(&REPORTED_QUEUE_FULL, "analytics_event_queue_full");
+            tracing::warn!(event = %payload.event, "analytics event dropped because the queue is full");
+            return;
+        };
+
+        Self::enrich_payload(self.manager, &mut payload);
+
+        let needs_alias = !self.legacy_distinct_id_aliased();
+        let app_handle = self.manager.app_handle().clone();
+
+        let machine_id = anlg_host::fingerprint();
+        let client = state.client.clone();
+        let event = payload.event.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let _permit = permit;
+            if needs_alias {
+                Self::alias_legacy_distinct_id_with(client.clone(), app_handle).await;
+            }
+            if let Err(error) = client.event(machine_id, payload).await {
+                report_delivery_problem_once(
+                    &REPORTED_DELIVERY_FAILURE,
+                    "analytics_event_delivery_failed",
+                );
+                tracing::warn!(%error, %event, "analytics event delivery failed");
+            }
+        });
+    }
+
+    fn session_id(manager: &M) -> String {
+        let state = manager.state::<crate::ManagedState>();
+        let mut session = state
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session.session_id(SystemTime::now())
+    }
+
+    fn enrich_payload(manager: &M, payload: &mut anlg_analytics::AnalyticsPayload) {
+        let app_version = env!("APP_VERSION");
+        let app_identifier = manager.config().identifier.clone();
+        let git_hash = manager.misc().get_git_hash();
+        let bundle_id = manager.config().identifier.clone();
+        let session_id = Self::session_id(manager);
+        let groups = {
+            let state = manager.state::<crate::ManagedState>();
+            state
+                .groups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        };
+
+        payload
+            .props
+            .insert("$session_id".into(), session_id.into());
+
+        for (group_type, group_key) in groups {
+            payload
+                .groups
+                .get_or_insert_default()
+                .entry(group_type)
+                .or_insert(group_key);
+        }
+
+        payload
+            .props
+            .entry("app_version".into())
+            .or_insert(app_version.into());
+
+        payload
+            .props
+            .entry("surface".into())
+            .or_insert("desktop".into());
+
+        payload
+            .props
+            .entry("analytics_schema_version".into())
+            .or_insert(1.into());
+
+        payload
+            .props
+            .entry("app_identifier".into())
+            .or_insert(app_identifier.into());
+
+        payload
+            .props
+            .entry("git_hash".into())
+            .or_insert(git_hash.into());
+
+        payload
+            .props
+            .entry("bundle_id".into())
+            .or_insert(bundle_id.into());
+
+        payload.props.entry("$set".into()).or_insert_with(|| {
+            serde_json::json!({
+                "app_version": app_version
+            })
+        });
+    }
+
+    pub fn set_disabled(&self, disabled: bool) -> Result<(), crate::Error> {
+        {
+            let store = self.manager.store2().scoped_store(crate::PLUGIN_NAME)?;
+            store.set(crate::StoreKey::Disabled, disabled)?;
+        }
+        Ok(())
+    }
+
+    pub fn is_disabled(&self) -> Result<bool, crate::Error> {
+        let store = self.manager.store2().scoped_store(crate::PLUGIN_NAME)?;
+        let v = store.get(crate::StoreKey::Disabled)?.unwrap_or(false);
+        Ok(v)
+    }
+
+    pub async fn set_properties(
+        &self,
+        payload: anlg_analytics::PropertiesPayload,
+    ) -> Result<(), crate::Error> {
+        if !self.is_disabled()? {
+            self.alias_legacy_distinct_id().await;
+            let machine_id = anlg_host::fingerprint();
+
+            let state = self.manager.state::<crate::ManagedState>();
+            state
+                .client
+                .set_properties(machine_id, payload)
+                .await
+                .map_err(crate::Error::AnlgAnalytics)?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn identify(
+        &self,
+        user_id: impl Into<String>,
+        payload: anlg_analytics::PropertiesPayload,
+    ) -> Result<(), crate::Error> {
+        if !self.is_disabled()? {
+            self.alias_legacy_distinct_id().await;
+            let machine_id = anlg_host::fingerprint();
+            let user_id = user_id.into();
+
+            let state = self.manager.state::<crate::ManagedState>();
+            if let Some(group) = &payload.group {
+                state
+                    .groups
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(group.r#type.clone(), group.key.clone());
+            }
+            state
+                .client
+                .identify(user_id, machine_id, payload)
+                .await
+                .map_err(crate::Error::AnlgAnalytics)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn clear_groups(&self) {
+        self.manager
+            .state::<crate::ManagedState>()
+            .groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+pub trait AnalyticsPluginExt<R: tauri::Runtime> {
+    fn analytics(&self) -> Analytics<'_, R, Self>
+    where
+        Self: tauri::Manager<R> + Sized;
+}
+
+impl<R: tauri::Runtime, T: tauri::Manager<R>> AnalyticsPluginExt<R> for T {
+    fn analytics(&self) -> Analytics<'_, R, Self>
+    where
+        Self: Sized,
+    {
+        Analytics {
+            manager: self,
+            _runtime: std::marker::PhantomData,
+        }
+    }
+}

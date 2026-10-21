@@ -1,0 +1,59 @@
+mod auth;
+mod error;
+mod mcp;
+mod oauth;
+mod routes;
+mod state;
+
+pub use auth::require_cloud_connector_auth;
+pub use error::CloudApiError;
+pub use oauth::metadata_router as oauth_metadata_router;
+pub use routes::{connector_router, management_router};
+pub use state::{AppState, CloudApiConfig};
+
+pub fn openapi() -> utoipa::openapi::OpenApi {
+    use utoipa::OpenApi;
+
+    #[derive(OpenApi)]
+    #[openapi(
+        paths(
+            routes::get_settings,
+            routes::update_settings,
+            routes::list_keys,
+            routes::create_key,
+            routes::revoke_key,
+            routes::publish_snapshot,
+            routes::delete_snapshot,
+            routes::list_meetings,
+            routes::get_meeting,
+            routes::get_transcript,
+            routes::get_history,
+            routes::export_meeting,
+        ),
+        components(schemas(
+            routes::CloudApiSettings,
+            routes::UpdateSettingsBody,
+            routes::ApiKeyInfo,
+            routes::CreatedApiKey,
+            routes::CreateApiKeyBody,
+            routes::SnapshotReceipt,
+            error::ErrorEnvelope,
+            anlg_agent_access::MeetingListItem,
+            anlg_agent_access::MeetingPage,
+            anlg_agent_access::Pagination,
+            anlg_agent_access::TranscriptPage,
+            anlg_agent_access::Document,
+            anlg_agent_access::Participant,
+            anlg_agent_access::ActionItem,
+            anlg_agent_access::Meeting,
+            anlg_agent_access::Transcript,
+            anlg_agent_access::MeetingExport,
+        )),
+        tags(
+            (name = "cloud-api", description = "Opt-in hosted access to Anarlog meeting data")
+        )
+    )]
+    struct CloudApiDoc;
+
+    CloudApiDoc::openapi()
+}

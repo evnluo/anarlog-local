@@ -1,0 +1,302 @@
+import type {
+  ChangelogState,
+  ContactsState,
+  EditorView,
+  SessionsState as WindowsSessionsState,
+  TabInput as WindowsTabInput,
+  TemplatesState,
+} from "@anlg/plugin-windows";
+
+export type { EditorView };
+
+export type SessionsState = WindowsSessionsState & {
+  scheduledAutoStart?: boolean | null;
+};
+
+type WindowsSupportedWindowTabInput = Exclude<
+  WindowsTabInput,
+  { type: "extension" } | { type: "extensions" } | { type: "folders" }
+>;
+
+export type SupportedWindowTabInput =
+  | Exclude<WindowsSupportedWindowTabInput, { type: "sessions" }>
+  | (Omit<
+      Extract<WindowsSupportedWindowTabInput, { type: "sessions" }>,
+      "state"
+    > & {
+      state?: SessionsState | null;
+    });
+
+export type TabInput =
+  | SupportedWindowTabInput
+  | { type: "automations" }
+  | { type: "folders" }
+  | { type: "shared_sessions"; id: string }
+  | { type: "shared_note_preview"; id: string };
+
+export const isTabInputSupported = (
+  tab: WindowsTabInput,
+): tab is SupportedWindowTabInput => {
+  return (
+    tab.type !== "extension" &&
+    tab.type !== "extensions" &&
+    tab.type !== "folders"
+  );
+};
+
+export type SettingsTab =
+  | "account"
+  | "billing"
+  | "referrals"
+  | "stats"
+  | "insights"
+  | "app"
+  | "meetings"
+  | "audio"
+  | "appearance"
+  | "sync"
+  | "team"
+  | "notifications"
+  | "imports"
+  | "crm"
+  | "developers"
+  | "privacy"
+  | "permissions"
+  | "dictionary"
+  | "dictation"
+  | "transcription"
+  | "intelligence"
+  | "todo";
+
+const normalizeSettingsTab = (
+  tab: string | null | undefined,
+): Exclude<SettingsTab, "account"> => {
+  switch (tab) {
+    case "billing":
+    case "referrals":
+    case "stats":
+    case "insights":
+    case "app":
+    case "meetings":
+    case "appearance":
+    case "sync":
+    case "team":
+    case "notifications":
+    case "imports":
+    case "crm":
+    case "developers":
+    case "privacy":
+    case "permissions":
+    case "dictionary":
+    case "dictation":
+    case "transcription":
+    case "intelligence":
+    case "todo":
+      return tab;
+    case "audio":
+      return "meetings";
+    case "personalization":
+      return "dictionary";
+    case "data":
+      return "imports";
+    case "account":
+    default:
+      return "app";
+  }
+};
+
+type SettingsState = {
+  tab: SettingsTab | null;
+};
+
+type DailySummaryState = {
+  activeTab: "timeline" | "raw" | null;
+};
+
+type BaseTab = {
+  active: boolean;
+  slotId: string;
+  pinned: boolean;
+  returnToSlotId?: string;
+  returnToTabId?: string;
+};
+
+export type Tab =
+  | (BaseTab & {
+      type: "sessions";
+      id: string;
+      state: SessionsState;
+    })
+  | (BaseTab & { type: "shared_sessions"; id: string })
+  | (BaseTab & { type: "shared_note_preview"; id: string })
+  | (BaseTab & {
+      type: "contacts";
+      state: ContactsState;
+    })
+  | (BaseTab & {
+      type: "templates";
+      state: TemplatesState;
+    })
+  | (BaseTab & { type: "automations" })
+  | (BaseTab & { type: "folders" })
+  | (BaseTab & {
+      type: "humans";
+      id: string;
+    })
+  | (BaseTab & { type: "organizations"; id: string })
+  | (BaseTab & { type: "empty" })
+  | (BaseTab & { type: "calendar" })
+  | (BaseTab & {
+      type: "changelog";
+      state: ChangelogState;
+    })
+  | (BaseTab & { type: "settings"; state: SettingsState })
+  | (BaseTab & { type: "onboarding" })
+  | (BaseTab & { type: "edit"; requestId: string })
+  | (BaseTab & {
+      type: "task";
+      id: string;
+      resources: TaskResource[];
+    })
+  | (BaseTab & {
+      type: "daily_summary";
+      id: string;
+      state: DailySummaryState;
+    });
+
+export type TaskResource =
+  | { type: "github_issue"; owner: string; repo: string; number: number }
+  | { type: "github_pr"; owner: string; repo: string; number: number };
+
+export const getDefaultState = (tab: TabInput): Tab => {
+  const base = { active: false, slotId: "", pinned: false };
+
+  switch (tab.type) {
+    case "sessions":
+      return {
+        ...base,
+        type: "sessions",
+        id: tab.id,
+        state: tab.state
+          ? {
+              ...tab.state,
+              scheduledAutoStart: tab.state.scheduledAutoStart ?? null,
+            }
+          : {
+              view: null,
+              autoStart: null,
+              scheduledAutoStart: null,
+            },
+      };
+    case "shared_sessions":
+      return { ...base, type: "shared_sessions", id: tab.id };
+    case "shared_note_preview":
+      return { ...base, type: "shared_note_preview", id: tab.id };
+    case "contacts":
+      return {
+        ...base,
+        type: "contacts",
+        state: tab.state ?? {
+          selected: null,
+        },
+      };
+    case "templates":
+      return {
+        ...base,
+        type: "templates",
+        state: tab.state ?? {
+          showHomepage: false,
+          isWebMode: true,
+          selectedMineId: null,
+          selectedWebIndex: null,
+        },
+      };
+    case "automations":
+      return { ...base, type: "automations" };
+    case "folders":
+      return { ...base, type: "folders" };
+    case "humans":
+      return { ...base, type: "humans", id: tab.id };
+    case "organizations":
+      return { ...base, type: "organizations", id: tab.id };
+    case "empty":
+      return { ...base, type: "empty" };
+    case "calendar":
+      return { ...base, type: "calendar" };
+    case "changelog":
+      return {
+        ...base,
+        type: "changelog",
+        state: tab.state,
+      };
+    case "settings": {
+      const subtab = tab.state?.tab as string | null | undefined;
+      if (subtab === "calendar") {
+        return { ...base, type: "calendar" };
+      }
+      if (subtab === "automations") {
+        return { ...base, type: "automations" };
+      }
+      if (subtab === "folders") {
+        return { ...base, type: "folders" };
+      }
+      return {
+        ...base,
+        type: "settings",
+        state: {
+          tab: subtab === "account" ? "account" : normalizeSettingsTab(subtab),
+        },
+      };
+    }
+    case "onboarding":
+      return { ...base, type: "onboarding" };
+    case "edit":
+      return { ...base, type: "edit", requestId: tab.requestId };
+    default:
+      const _exhaustive: never = tab;
+      return _exhaustive;
+  }
+};
+
+export const uniqueIdfromTab = (tab: Tab): string => {
+  switch (tab.type) {
+    case "sessions":
+      return `sessions-${tab.id}`;
+    case "shared_sessions":
+      return `shared-sessions-${tab.id}`;
+    case "shared_note_preview":
+      return `shared-note-preview-${tab.id}`;
+    case "humans":
+      return `humans-${tab.id}`;
+    case "organizations":
+      return `organizations-${tab.id}`;
+    case "contacts":
+      return `contacts`;
+    case "templates":
+      return `templates`;
+    case "automations":
+      return `automations`;
+    case "folders":
+      return `folders`;
+    case "empty":
+      return `empty-${tab.slotId}`;
+    case "calendar":
+      return `calendar`;
+    case "changelog":
+      return "changelog";
+    case "settings":
+      return `settings`;
+    case "onboarding":
+      return `onboarding`;
+    case "edit":
+      return `edit-${tab.requestId}`;
+    case "task":
+      return `task-${tab.id}`;
+    case "daily_summary":
+      return `daily_summary-${tab.id}`;
+  }
+};
+
+export const isSameTab = (a: Tab, b: Tab) => {
+  return uniqueIdfromTab(a) === uniqueIdfromTab(b);
+};

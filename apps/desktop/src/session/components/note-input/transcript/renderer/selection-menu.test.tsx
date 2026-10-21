@@ -1,0 +1,350 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  cleanup,
+  fireEvent,
+  render as testingRender,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { createRef, type ReactNode } from "react";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+import { MultiSelectionBar, SelectionMenu } from "./selection-menu";
+import type { TranscriptContextMenuRequest } from "./selection-menu";
+
+import { setSessionFabSelectionHost } from "~/session/components/floating/selection-slot";
+
+function render(ui: ReactNode) {
+  return testingRender(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+      }
+    >
+      {ui}
+    </QueryClientProvider>,
+  );
+}
+
+vi.mock("@floating-ui/react", () => ({
+  autoUpdate: vi.fn(),
+  flip: vi.fn(),
+  FloatingPortal: ({ children }: { children: ReactNode }) => children,
+  offset: vi.fn(),
+  shift: vi.fn(),
+  useFloating: () => ({
+    refs: {
+      setFloating: vi.fn(),
+      setPositionReference: vi.fn(),
+    },
+    floatingStyles: {},
+    update: vi.fn(),
+  }),
+}));
+
+vi.mock("./speaker-assign", () => ({
+  SpeakerParticipantPicker: ({
+    onSelect,
+  }: {
+    onSelect?: (humanId: string) => void;
+  }) => (
+    <button type="button" onClick={() => onSelect?.("human-1")}>
+      Confirm
+    </button>
+  ),
+}));
+
+vi.mock("~/shared/hooks/useAutoCloser", () => ({
+  useAutoCloser: () => ({ current: null }),
+}));
+
+beforeAll(() => {
+  Object.assign(Range.prototype, {
+    getBoundingClientRect: () => new DOMRect(20, 700, 100, 20),
+    getClientRects(this: Range) {
+      const text = this.toString();
+      return text ? [new DOMRect(20, 700, text.length * 10, 20)] : [];
+    },
+  });
+});
+
+afterEach(() => {
+  cleanup();
+  window.getSelection()?.removeAllRanges();
+  document.body.replaceChildren();
+  setSessionFabSelectionHost(null);
+});
+
+describe("SelectionMenu", () => {
+  it("closes the menu before editing the selected words", () => {
+    const request = createContextRequest();
+    const calls: string[] = [];
+    const onEdit = vi.fn(() => calls.push("edit"));
+    render(
+      <SelectionMenu
+        containerRef={createRef()}
+        contextRequest={request}
+        audioExists={false}
+        onContextClose={() => calls.push("close")}
+        onEdit={onEdit}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(onEdit).toHaveBeenCalledWith(request.selection);
+    expect(calls).toEqual(["close", "edit"]);
+    expect(
+      screen.getByRole("button", { name: "Copy" }).querySelector("svg"),
+    ).not.toBeNull();
+  });
+
+  it("closes the text menu and requests a speaker split instead of expanding the picker", () => {
+    const request = createContextRequest();
+    const calls: string[] = [];
+    const onChangeSpeaker = vi.fn(() => calls.push("split"));
+    render(
+      <SelectionMenu
+        containerRef={createRef()}
+        contextRequest={request}
+        audioExists={false}
+        onContextClose={() => calls.push("close")}
+        onChangeSpeaker={onChangeSpeaker}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Change speaker from here" }),
+    );
+    expect(onChangeSpeaker).toHaveBeenCalledWith(request.selection);
+    expect(calls).toEqual(["close", "split"]);
+    expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
+  });
+
+  it("hides playback when the transcript has no audio", () => {
+    render(
+      <SelectionMenu
+        containerRef={createRef()}
+        contextRequest={createContextRequest()}
+        audioExists={false}
+        onContextClose={vi.fn()}
+        onChangeSpeaker={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Play from here" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Change speaker from here" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Copy$/ })).toBeTruthy();
+  });
+
+  it("keeps playback available when the transcript has audio", () => {
+    render(
+      <SelectionMenu
+        containerRef={createRef()}
+        contextRequest={createContextRequest()}
+        audioExists
+        onContextClose={vi.fn()}
+        onChangeSpeaker={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Play from here" })).toBeTruthy();
+  });
+
+  it("paints its own highlight only once the native selection is gone", () => {
+    const request = createContextRequest();
+    window.getSelection()?.addRange(request.range);
+
+    render(
+      <SelectionMenu
+        containerRef={createRef()}
+        contextRequest={request}
+        audioExists={false}
+        onContextClose={vi.fn()}
+        onChangeSpeaker={vi.fn()}
+      />,
+    );
+
+    expect(
+      document.querySelectorAll("[data-transcript-selection-overlay]"),
+    ).toHaveLength(0);
+
+    window.getSelection()?.removeAllRanges();
+    fireEvent(document, new Event("selectionchange"));
+
+    expect(
+      document.querySelectorAll("[data-transcript-selection-overlay]"),
+    ).toHaveLength(1);
+  });
+});
+
+describe("MultiSelectionBar", () => {
+  const selection = {
+    sessionId: "session-1",
+    text: "Hello",
+    startMs: 0,
+    groups: [],
+  };
+
+  it("keeps merge disabled until contiguous entries are selected", () => {
+    render(
+      <MultiSelectionBar
+        selection={selection}
+        entryCount={2}
+        canMerge={false}
+        onClear={vi.fn()}
+        onAssignSpeaker={vi.fn()}
+        onMerge={vi.fn()}
+      />,
+    );
+
+    expect(
+      (screen.getByRole("button", { name: "Merge" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("assigns the current selection and then clears it", async () => {
+    const onAssignSpeaker = vi.fn(() => Promise.resolve());
+    const onClear = vi.fn();
+
+    render(
+      <MultiSelectionBar
+        selection={selection}
+        entryCount={2}
+        onClear={onClear}
+        onAssignSpeaker={onAssignSpeaker}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Change speaker" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => {
+      expect(onAssignSpeaker).toHaveBeenCalledWith(selection, "human-1");
+      expect(onClear).toHaveBeenCalled();
+    });
+  });
+
+  it("merges contiguous entries and then clears the selection", async () => {
+    const onMerge = vi.fn(() => Promise.resolve());
+    const onClear = vi.fn();
+
+    render(
+      <MultiSelectionBar
+        selection={selection}
+        entryCount={2}
+        canMerge
+        onClear={onClear}
+        onAssignSpeaker={vi.fn()}
+        onMerge={onMerge}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+
+    await waitFor(() => {
+      expect(onMerge).toHaveBeenCalled();
+      expect(onClear).toHaveBeenCalled();
+    });
+  });
+
+  it("deletes the selected blocks and clears selection only after saving", async () => {
+    let finish!: () => void;
+    const onDelete = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const onClear = vi.fn();
+    render(
+      <MultiSelectionBar
+        selection={selection}
+        entryCount={2}
+        onClear={onClear}
+        onAssignSpeaker={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(onDelete).toHaveBeenCalledWith(selection));
+    expect(onClear).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true),
+    );
+    finish();
+    await waitFor(() => expect(onClear).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps the selection available for retry if deleting fails", async () => {
+    const onDelete = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("save failed"))
+      .mockResolvedValueOnce(undefined);
+    const onClear = vi.fn();
+    render(
+      <MultiSelectionBar
+        selection={selection}
+        entryCount={2}
+        onClear={onClear}
+        onAssignSpeaker={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: "Delete" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false),
+    );
+    expect(onClear).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(onClear).toHaveBeenCalledTimes(1));
+  });
+
+  it("renders into the session FAB selection slot when it is present", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    setSessionFabSelectionHost(host);
+
+    render(
+      <MultiSelectionBar
+        selection={selection}
+        entryCount={2}
+        onClear={vi.fn()}
+        onAssignSpeaker={vi.fn()}
+      />,
+    );
+
+    expect(host.textContent).toContain("2 selected");
+    expect(host.firstElementChild?.className).not.toContain("absolute");
+
+    host.remove();
+  });
+});
+
+function createContextRequest(): TranscriptContextMenuRequest {
+  const container = document.createElement("div");
+  container.textContent = "Test";
+  document.body.append(container);
+  const range = document.createRange();
+  range.selectNodeContents(container);
+
+  return {
+    id: crypto.randomUUID(),
+    range,
+    selection: {
+      sessionId: "session-1",
+      text: "Test",
+      startMs: 0,
+      groups: [],
+    },
+    x: 20,
+    y: 700,
+  };
+}

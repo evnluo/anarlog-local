@@ -1,0 +1,23 @@
+{
+  "name": "@anlg/pricing",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./trial": "./src/trial.ts",
+    "./ui": "./src/plan-feature-list.tsx"
+  },
+  "dependencies": {
+    "@anlg/ui": "workspace:^",
+    "@anlg/utils": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

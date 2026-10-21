@@ -1,0 +1,24 @@
+[package]
+name = "api-pyannote"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anlg-api-auth = { workspace = true }
+anlg-api-env = { workspace = true }
+anlg-api-error = { workspace = true }
+anlg-pyannote-cloud = { workspace = true }
+
+axum = { workspace = true }
+base64 = { workspace = true }
+hmac = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+utoipa = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true }
+wiremock = { workspace = true }

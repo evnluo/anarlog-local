@@ -1,0 +1,75 @@
+import { Slot } from "@radix-ui/react-slot";
+import { cva, type VariantProps } from "class-variance-authority";
+import * as React from "react";
+
+import { useSquircleRef } from "@anlg/ui/hooks/use-squircle";
+import { squircleFocusVisibleClassName } from "@anlg/ui/lib/squircle";
+import { cn } from "@anlg/utils";
+
+const buttonVariants = cva(
+  cn([
+    squircleFocusVisibleClassName,
+    "inline-flex cursor-pointer items-center justify-center gap-2 rounded-full text-sm font-medium whitespace-nowrap transition-all disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0",
+  ]),
+  {
+    variants: {
+      variant: {
+        default:
+          "bg-primary text-primary-foreground hover:bg-primary/90 shadow-xs",
+        destructive:
+          "bg-destructive text-destructive-foreground hover:bg-destructive/90 shadow-xs",
+        outline:
+          "border-input bg-background hover:bg-accent hover:text-accent-foreground border shadow-xs",
+        secondary:
+          "bg-secondary text-secondary-foreground hover:bg-secondary/80 shadow-xs",
+        ghost: "hover:bg-accent hover:text-accent-foreground",
+        link: "text-primary underline-offset-4 hover:underline",
+      },
+      size: {
+        default: "h-9 px-4 py-2",
+        sm: "h-7 px-2 text-xs",
+        lg: "h-10 px-8",
+        icon: "size-7",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default",
+    },
+  },
+);
+
+export interface ButtonProps
+  extends
+    React.ButtonHTMLAttributes<HTMLButtonElement>,
+    VariantProps<typeof buttonVariants> {
+  asChild?: boolean;
+  smoothCorners?: boolean;
+}
+
+const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  (
+    {
+      className,
+      variant,
+      size,
+      asChild = false,
+      smoothCorners = true,
+      ...props
+    },
+    ref,
+  ) => {
+    const Comp = asChild ? Slot : "button";
+    const squircleRef = useSquircleRef(ref);
+    return (
+      <Comp
+        className={cn([buttonVariants({ variant, size, className })])}
+        {...props}
+        ref={smoothCorners ? squircleRef : ref}
+      />
+    );
+  },
+);
+Button.displayName = "Button";
+
+export { Button, buttonVariants };

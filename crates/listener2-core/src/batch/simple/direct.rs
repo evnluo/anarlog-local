@@ -1,0 +1,506 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use owhisper_client::{
+    AdapterKind, AnarlogAdapter, AquaVoiceAdapter, ArgmaxAdapter, AssemblyAIAdapter,
+    AwsTranscribeAdapter, AzureSpeechAdapter, BatchSttAdapter, BatchUploadLimit, CartesiaAdapter,
+    CohereAdapter, DeepgramAdapter, ElevenLabsAdapter, FireworksAdapter, GladiaAdapter,
+    GoogleCloudAdapter, GoogleGenerativeAiAdapter, GroqAdapter, MetaAdapter, MistralAdapter,
+    OpenAIAdapter, OpenRouterAdapter, PyannoteAdapter, RevAiAdapter, SiliconFlowAdapter,
+    SmallestAIAdapter, SonioxAdapter, SpeechmaticsAdapter, TogetherAdapter, WisprFlowAdapter,
+    XaiAdapter, ZaiAdapter,
+};
+use owhisper_interface::batch::{Alternatives, Channel, Response, Results};
+use tracing::Instrument;
+
+use super::super::upload::{audio_duration, segment_plan, split_batch_upload};
+use super::super::{
+    BatchParams, BatchRunMode, BatchRunOutput, format_user_friendly_error, log_batch_failure,
+    session_span,
+};
+
+pub(super) const DIRECT_BATCH_TIMEOUT_FLOOR: Duration = Duration::from_secs(15 * 60);
+pub(super) const DIRECT_BATCH_TIMEOUT_CEILING: Duration = Duration::from_secs(6 * 60 * 60);
+const DIRECT_BATCH_TIMEOUT_BUFFER: Duration = Duration::from_secs(5 * 60);
+const DIRECT_BATCH_AUDIO_DURATION_MULTIPLIER: u32 = 2;
+const ANARLOG_PROXY_MAX_AUDIO_BYTES: u64 = 512 * 1024 * 1024;
+// Provider quotas are mostly per-minute windows. Segmented uploads fire several
+// requests back to back, so a 429 usually clears within the next minute.
+const RATE_LIMIT_MAX_RETRIES: u32 = 3;
+pub(super) const RATE_LIMIT_BASE_DELAY: Duration = Duration::from_secs(15);
+pub(super) const RATE_LIMIT_MAX_DELAY: Duration = Duration::from_secs(90);
+
+pub(super) enum PreparedBatchUpload {
+    Original(PathBuf),
+    Compressed {
+        _temp_dir: tempfile::TempDir,
+        path: PathBuf,
+    },
+}
+
+impl PreparedBatchUpload {
+    pub(super) fn path(&self) -> &Path {
+        match self {
+            Self::Original(path) | Self::Compressed { path, .. } => path,
+        }
+    }
+}
+
+macro_rules! dispatch_batch {
+    ($ak:expr, $params:expr, $lp:expr, $limit:expr,
+     { $($var:ident => $adapter:ty),+ $(,)? },
+     unsupported: [$($unsup:ident),* $(,)?]
+    ) => {
+        match $ak {
+            $(AdapterKind::$var => {
+                run_direct_batch::<$adapter>(&AdapterKind::$var.to_string(), $params, $lp, $limit)
+                    .await
+            })+
+            $(AdapterKind::$unsup => {
+                Err(crate::BatchFailure::DirectBatchUnsupported {
+                    provider: AdapterKind::$unsup.to_string(),
+                }.into())
+            })*
+        }
+    };
+}
+
+pub(in crate::batch) async fn run_direct_batch_for_adapter_kind(
+    adapter_kind: AdapterKind,
+    params: BatchParams,
+    listen_params: owhisper_interface::ListenParams,
+) -> crate::Result<BatchRunOutput> {
+    if adapter_kind == AdapterKind::Anarlog {
+        return run_anarlog_batch(params, listen_params).await;
+    }
+    if adapter_kind == AdapterKind::GoogleCloud {
+        return super::google_cloud::run(params, listen_params).await;
+    }
+
+    let limit = adapter_kind.batch_upload_limit(listen_params.model.as_deref());
+
+    dispatch_batch!(adapter_kind, params, listen_params, limit, {
+        Argmax => ArgmaxAdapter,
+        Cartesia => CartesiaAdapter,
+        Deepgram => DeepgramAdapter,
+        Soniox => SonioxAdapter,
+        AssemblyAI => AssemblyAIAdapter,
+        Fireworks => FireworksAdapter,
+        OpenAI => OpenAIAdapter,
+        AmazonBedrock => owhisper_client::AmazonBedrockAdapter,
+        OpenRouter => OpenRouterAdapter,
+        SiliconFlow => SiliconFlowAdapter,
+        Zai => ZaiAdapter,
+        Gladia => GladiaAdapter,
+        ElevenLabs => ElevenLabsAdapter,
+        Pyannote => PyannoteAdapter,
+        Mistral => MistralAdapter,
+        Meta => MetaAdapter,
+        Anarlog => AnarlogAdapter,
+        AquaVoice => AquaVoiceAdapter,
+        Cohere => CohereAdapter,
+        AwsTranscribe => AwsTranscribeAdapter,
+        AzureSpeech => AzureSpeechAdapter,
+        GoogleCloud => GoogleCloudAdapter,
+        GoogleGenerativeAi => GoogleGenerativeAiAdapter,
+        Groq => GroqAdapter,
+        RevAi => RevAiAdapter,
+        Speechmatics => SpeechmaticsAdapter,
+        Together => TogetherAdapter,
+        Xai => XaiAdapter,
+        SmallestAI => SmallestAIAdapter,
+        WisprFlow => WisprFlowAdapter,
+    }, unsupported: [DashScope, Nari, Inworld, Gradium, Modulate, Alebex, Nvidia])
+}
+
+async fn run_anarlog_batch(
+    mut params: BatchParams,
+    listen_params: owhisper_interface::ListenParams,
+) -> crate::Result<BatchRunOutput> {
+    let upload =
+        prepare_anarlog_batch_upload(&params.file_path, ANARLOG_PROXY_MAX_AUDIO_BYTES).await?;
+    params.file_path = upload.path().to_string_lossy().into_owned();
+    run_direct_batch::<AnarlogAdapter>(
+        &AdapterKind::Anarlog.to_string(),
+        params,
+        listen_params,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn prepare_anarlog_batch_upload(
+    file_path: &str,
+    max_bytes: u64,
+) -> crate::Result<PreparedBatchUpload> {
+    let source_path = PathBuf::from(file_path);
+    let source_size = tokio::fs::metadata(&source_path).await?.len();
+    if source_size <= max_bytes {
+        return Ok(PreparedBatchUpload::Original(source_path));
+    }
+
+    let is_wav = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
+    if !is_wav {
+        return Err(crate::BatchFailure::DirectRequestFailed {
+            provider: AdapterKind::Anarlog.to_string(),
+            message:
+                "This recording is too large for cloud transcription. Convert it to MP3 and try again."
+                    .to_string(),
+        }
+        .into());
+    }
+
+    let temp_dir =
+        super::super::upload::temporary_audio_directory(file_path).map_err(|_error| {
+            tracing::error!(
+                error.type = "temp_dir_create_failed",
+                "large_batch_audio_temp_dir_failed"
+            );
+            crate::BatchFailure::DirectRequestFailed {
+                provider: AdapterKind::Anarlog.to_string(),
+                message: "Anarlog couldn't prepare this large recording for transcription."
+                    .to_string(),
+            }
+        })?;
+    let encoded_path = temp_dir.path().join("audio.mp3");
+    let encode_source = source_path.clone();
+    let encode_target = encoded_path.clone();
+    tokio::task::spawn_blocking(move || anlg_mp3::encode_wav(&encode_source, &encode_target))
+        .await
+        .map_err(|_error| {
+            tracing::error!(
+                error.type = "local_task_join_failed",
+                "large_batch_audio_encode_task_failed"
+            );
+            crate::BatchFailure::DirectRequestFailed {
+                provider: AdapterKind::Anarlog.to_string(),
+                message: "Anarlog couldn't prepare this large recording for transcription."
+                    .to_string(),
+            }
+        })?
+        .map_err(|_error| {
+            tracing::error!(
+                error.type = "audio_encode_failed",
+                "large_batch_audio_encode_failed"
+            );
+            crate::BatchFailure::DirectRequestFailed {
+                provider: AdapterKind::Anarlog.to_string(),
+                message: "Anarlog couldn't prepare this large recording for transcription."
+                    .to_string(),
+            }
+        })?;
+
+    let encoded_size = tokio::fs::metadata(&encoded_path).await?.len();
+    if encoded_size > max_bytes {
+        return Err(crate::BatchFailure::DirectRequestFailed {
+            provider: AdapterKind::Anarlog.to_string(),
+            message:
+                "This recording is too large for cloud transcription. Split it into smaller files and try again."
+                    .to_string(),
+        }
+        .into());
+    }
+
+    tracing::info!(
+        source_size,
+        encoded_size,
+        "large_batch_audio_compressed_for_upload"
+    );
+
+    Ok(PreparedBatchUpload::Compressed {
+        _temp_dir: temp_dir,
+        path: encoded_path,
+    })
+}
+
+pub(super) async fn run_direct_batch<A: BatchSttAdapter>(
+    provider: &str,
+    params: BatchParams,
+    listen_params: owhisper_interface::ListenParams,
+    limit: Option<BatchUploadLimit>,
+) -> crate::Result<BatchRunOutput> {
+    let audio_duration = audio_duration(&params.file_path);
+    let timeout = direct_batch_timeout_for_audio(audio_duration);
+
+    match segment_plan(&params.file_path, audio_duration, limit) {
+        Some(segment_duration) => {
+            run_segmented_batch::<A>(provider, params, listen_params, segment_duration, timeout)
+                .await
+        }
+        None => run_direct_batch_with_timeout::<A>(provider, params, listen_params, timeout).await,
+    }
+}
+
+async fn run_segmented_batch<A: BatchSttAdapter>(
+    provider: &str,
+    params: BatchParams,
+    mut listen_params: owhisper_interface::ListenParams,
+    segment_duration: Duration,
+    timeout: Duration,
+) -> crate::Result<BatchRunOutput> {
+    let segments = split_batch_upload(&params.file_path, segment_duration, provider).await?;
+    listen_params.channels = 1;
+
+    let mut responses = Vec::with_capacity(segments.paths().len());
+    for path in segments.paths() {
+        let mut segment_params = params.clone();
+        segment_params.file_path = path.to_string_lossy().into_owned();
+
+        let output = run_direct_batch_with_timeout::<A>(
+            provider,
+            segment_params,
+            listen_params.clone(),
+            timeout,
+        )
+        .await?;
+        responses.push(output.response);
+    }
+
+    Ok(BatchRunOutput {
+        session_id: params.session_id,
+        mode: BatchRunMode::Direct,
+        response: merge_segment_responses(responses, segment_duration),
+    })
+}
+
+/// Segments are transcribed independently, so their timestamps restart at zero.
+pub(super) fn merge_segment_responses(
+    responses: Vec<Response>,
+    segment_duration: Duration,
+) -> Response {
+    let mut metadata = serde_json::Value::Null;
+    let mut speaker_labels = Vec::new();
+    let mut speaker_segments = Vec::new();
+    let mut speaker_offset = 0;
+    let mut transcripts: Vec<String> = Vec::new();
+    let mut words = Vec::new();
+
+    for (index, response) in responses.into_iter().enumerate() {
+        let offset = segment_duration.as_secs_f64() * index as f64;
+        let segment_speaker_labels = response
+            .metadata
+            .get("speaker_labels")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        speaker_labels.extend(segment_speaker_labels.iter().cloned());
+        speaker_segments.extend(
+            response
+                .metadata
+                .get("speaker_segments")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(|mut segment| {
+                    for field in ["start", "end"] {
+                        if let Some(value) = segment.get_mut(field)
+                            && let Some(time) = value.as_f64()
+                        {
+                            *value = serde_json::json!(time + offset);
+                        }
+                    }
+                    segment
+                }),
+        );
+        if metadata.is_null() {
+            metadata = response.metadata;
+        }
+
+        let Some(alternative) = response
+            .results
+            .channels
+            .into_iter()
+            .next()
+            .and_then(|channel| channel.alternatives.into_iter().next())
+        else {
+            continue;
+        };
+
+        let transcript = alternative.transcript.trim();
+        if !transcript.is_empty() {
+            transcripts.push(transcript.to_string());
+        }
+        let segment_speaker_count = alternative
+            .words
+            .iter()
+            .filter_map(|word| word.speaker)
+            .max()
+            .map_or(0, |speaker| speaker + 1)
+            .max(segment_speaker_labels.len());
+        words.extend(alternative.words.into_iter().map(|mut word| {
+            word.start += offset;
+            word.end += offset;
+            word.speaker = word.speaker.map(|speaker| speaker + speaker_offset);
+            word
+        }));
+        speaker_offset += segment_speaker_count;
+    }
+
+    if let Some(object) = metadata.as_object_mut() {
+        if !speaker_labels.is_empty() {
+            object.insert(
+                "speaker_labels".to_string(),
+                serde_json::Value::Array(speaker_labels),
+            );
+        }
+        if !speaker_segments.is_empty() {
+            object.insert(
+                "speaker_segments".to_string(),
+                serde_json::Value::Array(speaker_segments),
+            );
+        }
+    }
+
+    Response {
+        metadata: if metadata.is_null() {
+            serde_json::json!({})
+        } else {
+            metadata
+        },
+        results: Results {
+            channels: vec![Channel {
+                alternatives: vec![Alternatives {
+                    transcript: transcripts.join(" "),
+                    confidence: 1.0,
+                    words,
+                }],
+            }],
+        },
+    }
+}
+
+pub(super) async fn run_direct_batch_with_timeout<A: BatchSttAdapter>(
+    provider: &str,
+    params: BatchParams,
+    listen_params: owhisper_interface::ListenParams,
+    timeout: Duration,
+) -> crate::Result<BatchRunOutput> {
+    let span = session_span(&params.session_id);
+
+    async {
+        let client = owhisper_client::BatchClient::<A>::builder()
+            .api_base(params.base_url.clone())
+            .api_key(params.api_key.clone())
+            .params(listen_params)
+            .build();
+
+        tracing::debug!("transcribing file");
+        let response = match tokio::time::timeout(
+            timeout,
+            transcribe_with_rate_limit_retry(&client, &params.file_path),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(err)) => {
+                let raw_error = format!("{err:?}");
+                let message = format_user_friendly_error(&raw_error);
+                log_batch_failure("direct_batch_transcription", &raw_error);
+                return Err(crate::BatchFailure::DirectRequestFailed {
+                    provider: provider.to_string(),
+                    message,
+                }
+                .into());
+            }
+            Err(_) => {
+                tracing::error!(
+                    timeout_seconds = timeout.as_secs(),
+                    "batch transcription timed out"
+                );
+                return Err(crate::BatchFailure::DirectRequestTimedOut {
+                    provider: provider.to_string(),
+                    timeout_seconds: timeout.as_secs(),
+                }
+                .into());
+            }
+        };
+        tracing::info!("batch transcription completed");
+
+        Ok(BatchRunOutput {
+            session_id: params.session_id,
+            mode: BatchRunMode::Direct,
+            response,
+        })
+    }
+    .instrument(span)
+    .await
+}
+
+async fn transcribe_with_rate_limit_retry<A: BatchSttAdapter>(
+    client: &owhisper_client::BatchClient<A>,
+    file_path: &str,
+) -> Result<Response, owhisper_client::Error> {
+    let mut attempt = 0;
+    loop {
+        let error = match client.transcribe_file(file_path).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        if attempt >= RATE_LIMIT_MAX_RETRIES {
+            return Err(error);
+        }
+        let Some(delay) = rate_limit_retry_delay(&error, attempt) else {
+            return Err(error);
+        };
+        attempt += 1;
+        tracing::warn!(
+            attempt,
+            delay_seconds = delay.as_secs(),
+            "batch transcription rate limited, retrying"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+pub(super) fn rate_limit_retry_delay(
+    error: &owhisper_client::Error,
+    attempt: u32,
+) -> Option<Duration> {
+    let body = match error {
+        owhisper_client::Error::UnexpectedStatus { status, body } if status.as_u16() == 429 => {
+            Some(body.as_str())
+        }
+        owhisper_client::Error::ProviderFailure {
+            status: Some(status),
+            ..
+        } if status.as_u16() == 429 => None,
+        _ => return None,
+    };
+    let backoff = RATE_LIMIT_BASE_DELAY.saturating_mul(2u32.saturating_pow(attempt));
+    let delay = body.and_then(server_retry_delay).unwrap_or(backoff);
+    Some(delay.min(RATE_LIMIT_MAX_DELAY))
+}
+
+/// Google APIs return `google.rpc.RetryInfo` in the 429 body, e.g.
+/// `{"error":{"details":[{"retryDelay":"37s"}]}}`.
+fn server_retry_delay(body: &str) -> Option<Duration> {
+    let payload: serde_json::Value = serde_json::from_str(body).ok()?;
+    payload
+        .pointer("/error/details")?
+        .as_array()?
+        .iter()
+        .find_map(|detail| detail.get("retryDelay"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.strip_suffix('s'))
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(Duration::from_secs_f64)
+}
+
+pub(super) fn direct_batch_timeout_for_audio(audio_duration: Option<Duration>) -> Duration {
+    let timeout = audio_duration
+        .map(|duration| {
+            duration
+                .saturating_mul(DIRECT_BATCH_AUDIO_DURATION_MULTIPLIER)
+                .saturating_add(DIRECT_BATCH_TIMEOUT_BUFFER)
+        })
+        .unwrap_or(DIRECT_BATCH_TIMEOUT_FLOOR);
+
+    timeout
+        .max(DIRECT_BATCH_TIMEOUT_FLOOR)
+        .min(DIRECT_BATCH_TIMEOUT_CEILING)
+}

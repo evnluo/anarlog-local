@@ -1,0 +1,1017 @@
+use base64::Engine;
+use std::sync::Arc;
+
+use owhisper_client::{
+    AssemblyAIAdapter, Auth, CartesiaAdapter, DashScopeAdapter, DashScopeStreamingAdapter,
+    DeepgramAdapter, DeepgramFluxAdapter, ElevenLabsAdapter, FireworksAdapter, GladiaAdapter,
+    MistralAdapter, OpenAIAdapter, Provider, RealtimeSttAdapter, SonioxAdapter,
+    normalize_listen_params,
+};
+use owhisper_interface::ListenParams;
+
+use crate::config::SttProxyConfig;
+use crate::provider_selector::SelectedProvider;
+use crate::query_params::{QueryParams, QueryValue};
+use crate::relay::{
+    ClientBinaryMessage, ClientBinaryMessageMapper, ClientMessageFilter, StreamingProxy,
+    StreamingProxyPlan, StreamingTransport, UpstreamEvent,
+};
+use crate::routes::AppState;
+use crate::routes::model_resolution::resolve_model_live;
+
+use super::session::init_session;
+use super::{AnalyticsContext, ProxyBuildError, build_on_close_callback, parse_param};
+
+fn build_listen_params(params: &QueryParams) -> ListenParams {
+    normalize_listen_params(ListenParams {
+        model: params.get_first("model").map(|s| s.to_string()),
+        languages: params.get_languages(),
+        sample_rate: parse_param(params, "sample_rate", 16000),
+        channels: parse_param(params, "channels", 1),
+        keywords: params.parse_keywords(),
+        num_speakers: params.parse_optional_u32("num_speakers"),
+        min_speakers: params.parse_optional_u32("min_speakers"),
+        max_speakers: params.parse_optional_u32("max_speakers"),
+        ..Default::default()
+    })
+}
+
+/// One task-protocol session per upstream: `[mic, spk]`. Split mode uses both; single mode uses `[0]`.
+type DashScopeStreamingSessions = [DashScopeStreamingAdapter; 2];
+
+fn dashscope_streaming_sessions(
+    provider: Provider,
+    model: Option<&str>,
+) -> Option<DashScopeStreamingSessions> {
+    (provider == Provider::DashScope && model.is_some_and(DashScopeStreamingAdapter::is_model))
+        .then(|| {
+            let mic = DashScopeStreamingAdapter::default();
+            let spk = mic.fork_session();
+            [mic, spk]
+        })
+}
+
+fn dashscope_upstream_completion() -> UpstreamEvent {
+    UpstreamEvent::new("/header/event", "task-finished")
+}
+
+fn upstream_readiness_for(adapter: &DashScopeStreamingAdapter) -> Option<UpstreamEvent> {
+    adapter
+        .initial_response_type()
+        .map(|expected| UpstreamEvent::new(adapter.initial_response_field(), expected))
+}
+
+fn build_upstream_url_with_adapter(
+    provider: Provider,
+    api_base: &str,
+    params: &ListenParams,
+    channels: u8,
+    dashscope_streaming: Option<&DashScopeStreamingAdapter>,
+) -> url::Url {
+    if let Some(adapter) = dashscope_streaming {
+        return adapter.build_ws_url(api_base, params, channels);
+    }
+    match provider {
+        Provider::Deepgram
+            if params
+                .model
+                .as_deref()
+                .is_some_and(DeepgramFluxAdapter::is_model) =>
+        {
+            DeepgramFluxAdapter.build_ws_url(api_base, params, channels)
+        }
+        Provider::Deepgram => DeepgramAdapter.build_ws_url(api_base, params, channels),
+        Provider::AssemblyAI => AssemblyAIAdapter.build_ws_url(api_base, params, channels),
+        Provider::Cartesia => CartesiaAdapter.build_ws_url(api_base, params, channels),
+        Provider::Soniox => SonioxAdapter.build_ws_url(api_base, params, channels),
+        Provider::Fireworks => FireworksAdapter.build_ws_url(api_base, params, channels),
+        Provider::OpenAI => OpenAIAdapter::default().build_ws_url(api_base, params, channels),
+        Provider::Gladia => GladiaAdapter.build_ws_url(api_base, params, channels),
+        Provider::ElevenLabs => ElevenLabsAdapter.build_ws_url(api_base, params, channels),
+        Provider::DashScope => DashScopeAdapter.build_ws_url(api_base, params, channels),
+        Provider::Mistral => MistralAdapter::default().build_ws_url(api_base, params, channels),
+        Provider::AquaVoice => unreachable!("aquavoice only supports batch transcription"),
+        Provider::Pyannote => unreachable!("pyannote only supports batch transcription"),
+        Provider::Cohere => unreachable!("cohere only supports batch transcription"),
+        Provider::AwsTranscribe
+        | Provider::AzureSpeech
+        | Provider::GoogleCloud
+        | Provider::Groq
+        | Provider::RevAi
+        | Provider::Speechmatics
+        | Provider::Together
+        | Provider::Xai
+        | Provider::Nari
+        | Provider::SmallestAI
+        | Provider::Meta
+        | Provider::GoogleGenerativeAi => {
+            unreachable!("direct BYOK provider is not configured in the proxy")
+        }
+    }
+}
+
+fn build_initial_message_with_adapter(
+    provider: Provider,
+    api_key: Option<&str>,
+    params: &ListenParams,
+    channels: u8,
+    dashscope_streaming: Option<&DashScopeStreamingAdapter>,
+) -> Option<String> {
+    let msg = match provider {
+        Provider::DashScope if dashscope_streaming.is_some() => {
+            dashscope_streaming?.initial_message(api_key, params, channels)
+        }
+        Provider::Deepgram
+            if params
+                .model
+                .as_deref()
+                .is_some_and(DeepgramFluxAdapter::is_model) =>
+        {
+            DeepgramFluxAdapter.initial_message(api_key, params, channels)
+        }
+        Provider::Deepgram => DeepgramAdapter.initial_message(api_key, params, channels),
+        Provider::AssemblyAI => AssemblyAIAdapter.initial_message(api_key, params, channels),
+        Provider::Cartesia => CartesiaAdapter.initial_message(api_key, params, channels),
+        Provider::Soniox => SonioxAdapter.initial_message(api_key, params, channels),
+        Provider::Fireworks => FireworksAdapter.initial_message(api_key, params, channels),
+        Provider::OpenAI => OpenAIAdapter::default().initial_message(api_key, params, channels),
+        Provider::Gladia => GladiaAdapter.initial_message(api_key, params, channels),
+        Provider::ElevenLabs => ElevenLabsAdapter.initial_message(api_key, params, channels),
+        Provider::DashScope => DashScopeAdapter.initial_message(api_key, params, channels),
+        Provider::Mistral => MistralAdapter::default().initial_message(api_key, params, channels),
+        Provider::AquaVoice => unreachable!("aquavoice only supports batch transcription"),
+        Provider::Pyannote => unreachable!("pyannote only supports batch transcription"),
+        Provider::Cohere => unreachable!("cohere only supports batch transcription"),
+        Provider::AwsTranscribe
+        | Provider::AzureSpeech
+        | Provider::GoogleCloud
+        | Provider::Groq
+        | Provider::RevAi
+        | Provider::Speechmatics
+        | Provider::Together
+        | Provider::Xai
+        | Provider::Nari
+        | Provider::SmallestAI
+        | Provider::Meta
+        | Provider::GoogleGenerativeAi => {
+            unreachable!("direct BYOK provider is not configured in the proxy")
+        }
+    };
+
+    msg.and_then(|m| match m {
+        owhisper_client::anlg_ws_client::client::Message::Text(t) => Some(t.to_string()),
+        _ => None,
+    })
+}
+
+fn build_response_transformer(
+    provider: Provider,
+    model: Option<&str>,
+) -> impl Fn(&str) -> Option<String> + Send + Sync + 'static {
+    let mistral_adapter = MistralAdapter::default();
+    let openai_adapter = OpenAIAdapter::default();
+    let is_deepgram_flux =
+        provider == Provider::Deepgram && model.is_some_and(DeepgramFluxAdapter::is_model);
+    let dashscope_streaming = dashscope_streaming_sessions(provider, model).map(|[mic, _]| mic);
+    move |raw: &str| {
+        let responses: Vec<owhisper_interface::stream::StreamResponse> = match provider {
+            Provider::Deepgram if is_deepgram_flux => DeepgramFluxAdapter.parse_response(raw),
+            Provider::DashScope if dashscope_streaming.is_some() => dashscope_streaming
+                .as_ref()
+                .map(|adapter| adapter.parse_response(raw))
+                .unwrap_or_default(),
+            Provider::Deepgram => DeepgramAdapter.parse_response(raw),
+            Provider::AssemblyAI => AssemblyAIAdapter.parse_response(raw),
+            Provider::Cartesia => CartesiaAdapter.parse_response(raw),
+            Provider::Soniox => SonioxAdapter.parse_response(raw),
+            Provider::Fireworks => FireworksAdapter.parse_response(raw),
+            Provider::OpenAI => openai_adapter.parse_response(raw),
+            Provider::Gladia => GladiaAdapter.parse_response(raw),
+            Provider::ElevenLabs => ElevenLabsAdapter.parse_response(raw),
+            Provider::DashScope => DashScopeAdapter.parse_response(raw),
+            Provider::Mistral => mistral_adapter.parse_response(raw),
+            Provider::AquaVoice => {
+                unreachable!("aquavoice only supports batch transcription")
+            }
+            Provider::Pyannote => unreachable!("pyannote only supports batch transcription"),
+            Provider::Cohere => unreachable!("cohere only supports batch transcription"),
+            Provider::AwsTranscribe
+            | Provider::AzureSpeech
+            | Provider::GoogleCloud
+            | Provider::Groq
+            | Provider::RevAi
+            | Provider::Speechmatics
+            | Provider::Together
+            | Provider::Xai
+            | Provider::Nari
+            | Provider::SmallestAI
+            | Provider::Meta
+            | Provider::GoogleGenerativeAi => {
+                unreachable!("direct BYOK provider is not configured in the proxy")
+            }
+        };
+
+        if provider == Provider::Soniox && proxy_debug_enabled() {
+            let normalized = serde_json::to_string(&responses)
+                .unwrap_or_else(|error| format!("serialize_error:{error}"));
+            tracing::info!(
+                anarlog.stt.provider.name = ?provider,
+                anarlog.payload.size_bytes = raw.len(),
+                anarlog.normalized.response_count = responses.len(),
+                raw = %raw,
+                normalized = %normalized,
+                "proxy_normalized_upstream_text"
+            );
+        }
+
+        if responses.is_empty() {
+            return None;
+        }
+
+        if responses.len() == 1 {
+            return serde_json::to_string(&responses[0]).ok();
+        }
+
+        serde_json::to_string(&responses).ok()
+    }
+}
+
+fn proxy_debug_enabled() -> bool {
+    std::env::var("LISTENER_DEBUG")
+        .map(|value| !value.is_empty() && value != "0" && value != "false")
+        .unwrap_or(false)
+}
+
+fn build_client_message_filter(
+    provider: Provider,
+    model: Option<&str>,
+    dashscope_streaming: Option<DashScopeStreamingAdapter>,
+) -> ClientMessageFilter {
+    let is_deepgram_flux =
+        provider == Provider::Deepgram && model.is_some_and(DeepgramFluxAdapter::is_model);
+    Arc::new(move |text: String| {
+        let msg = match serde_json::from_str::<owhisper_interface::ControlMessage>(&text) {
+            Ok(msg) => msg,
+            Err(_) => return Some(text),
+        };
+        if let Some(adapter) = &dashscope_streaming {
+            return match msg {
+                owhisper_interface::ControlMessage::Finalize => match adapter.finalize_message() {
+                    owhisper_client::anlg_ws_client::client::Message::Text(t) => {
+                        Some(t.to_string())
+                    }
+                    _ => None,
+                },
+                owhisper_interface::ControlMessage::KeepAlive
+                | owhisper_interface::ControlMessage::CloseStream => None,
+            };
+        }
+        if is_deepgram_flux {
+            return match msg {
+                owhisper_interface::ControlMessage::Finalize
+                | owhisper_interface::ControlMessage::CloseStream => {
+                    Some(r#"{"type":"CloseStream"}"#.to_string())
+                }
+                owhisper_interface::ControlMessage::KeepAlive => None,
+            };
+        }
+        provider.translate_control_message(&msg)
+    })
+}
+
+fn build_client_binary_message_mapper(
+    provider: Provider,
+    sample_rate: u32,
+) -> Option<ClientBinaryMessageMapper> {
+    match provider {
+        Provider::ElevenLabs => Some(Arc::new(|audio: Vec<u8>| {
+            let chunk = serde_json::json!({
+                "message_type": "input_audio_chunk",
+                "audio_base_64": base64::engine::general_purpose::STANDARD.encode(audio),
+            });
+
+            Some(ClientBinaryMessage::Text(chunk.to_string()))
+        })),
+        Provider::OpenAI => {
+            let adapter = OpenAIAdapter::for_live_sample_rate(sample_rate);
+            Some(Arc::new(move |audio: Vec<u8>| {
+                let owhisper_client::anlg_ws_client::client::Message::Text(message) =
+                    adapter.audio_to_message(audio.into())
+                else {
+                    return None;
+                };
+                Some(ClientBinaryMessage::Text(message.to_string()))
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn build_proxy_plan(
+    provider: Provider,
+    selected: &SelectedProvider,
+    channels: u8,
+    sample_rate: u32,
+    model: Option<&str>,
+    config: &SttProxyConfig,
+    analytics_ctx: AnalyticsContext,
+    dashscope_streaming: Option<&DashScopeStreamingSessions>,
+) -> Result<StreamingProxyPlan, crate::ProxyError> {
+    let mut plan = StreamingProxyPlan::new(StreamingTransport::for_channels(
+        channels,
+        provider.supports_native_multichannel()
+            && !(provider == Provider::Deepgram
+                && model.is_some_and(DeepgramFluxAdapter::is_model)),
+    )?)
+    .connect_timeout(config.connect_timeout)
+    .control_message_types(provider.control_message_types())
+    .response_transformer(build_response_transformer(provider, model))
+    .client_message_filter(build_client_message_filter(
+        provider,
+        model,
+        dashscope_streaming.map(|sessions| sessions[0].clone()),
+    ))
+    .apply_auth(selected);
+
+    if let Some(readiness) = dashscope_streaming.and_then(|s| upstream_readiness_for(&s[0])) {
+        plan = plan
+            .upstream_readiness(readiness)
+            .upstream_completion(dashscope_upstream_completion());
+    }
+
+    if plan.upstream_count() == 2 {
+        plan = plan.split_response_transformer(build_response_transformer(provider, model));
+        if let Some(sessions) = dashscope_streaming {
+            plan = plan.split_client_message_filter(build_client_message_filter(
+                provider,
+                model,
+                Some(sessions[1].clone()),
+            ));
+        }
+    }
+
+    if let Some(mapper) = build_client_binary_message_mapper(provider, sample_rate) {
+        plan = plan.client_binary_message_mapper(mapper);
+    }
+
+    if let Some(on_close) = build_on_close_callback(config, provider, &analytics_ctx) {
+        plan = plan.on_close(on_close);
+    }
+
+    Ok(plan)
+}
+
+fn build_proxy_with_adapter(
+    listen_params: &ListenParams,
+    channels: u8,
+    api_base: &str,
+    mut plan: StreamingProxyPlan,
+    provider: Provider,
+    api_key: &str,
+    dashscope_streaming: Option<&DashScopeStreamingSessions>,
+) -> Result<StreamingProxy, crate::ProxyError> {
+    let upstream_channels = plan.upstream_request_channels(channels);
+    let mic_adapter = dashscope_streaming.map(|s| &s[0]);
+
+    let upstream_url = build_upstream_url_with_adapter(
+        provider,
+        api_base,
+        listen_params,
+        upstream_channels,
+        mic_adapter,
+    );
+
+    let initial_message = build_initial_message_with_adapter(
+        provider,
+        Some(api_key),
+        listen_params,
+        upstream_channels,
+        mic_adapter,
+    );
+
+    if let Some(msg) = initial_message {
+        plan = plan.initial_message(msg);
+    }
+
+    if plan.upstream_count() == 2
+        && let Some(sessions) = dashscope_streaming
+        && let Some(msg) = build_initial_message_with_adapter(
+            provider,
+            Some(api_key),
+            listen_params,
+            upstream_channels,
+            Some(&sessions[1]),
+        )
+    {
+        plan = plan.split_initial_message(msg);
+    }
+
+    plan.build_from_upstream_url(upstream_url.as_str())
+}
+
+pub async fn build_proxy(
+    state: &AppState,
+    selected: &SelectedProvider,
+    params: &QueryParams,
+    analytics_ctx: AnalyticsContext,
+) -> Result<StreamingProxy, ProxyBuildError> {
+    let provider = selected.provider();
+    let channels: u8 = parse_param(params, "channels", 1);
+    if matches!(
+        provider,
+        Provider::AquaVoice | Provider::Pyannote | Provider::Cohere
+    ) {
+        return Err(ProxyBuildError::ProxyError(
+            crate::ProxyError::InvalidRequest(format!(
+                "{provider} only supports batch transcription"
+            )),
+        ));
+    }
+    let mut listen_params = build_listen_params(params);
+    resolve_model_live(provider, &mut listen_params);
+    let dashscope_streaming =
+        dashscope_streaming_sessions(provider, listen_params.model.as_deref());
+    let plan = build_proxy_plan(
+        provider,
+        selected,
+        channels,
+        listen_params.sample_rate,
+        listen_params.model.as_deref(),
+        &state.config,
+        analytics_ctx,
+        dashscope_streaming.as_ref(),
+    )?;
+    let api_base = selected
+        .upstream_url()
+        .unwrap_or(provider.default_api_base());
+
+    match provider.auth() {
+        Auth::SessionInit { header_name } => {
+            if selected.upstream_url().is_some() {
+                Ok(build_proxy_with_adapter(
+                    &listen_params,
+                    channels,
+                    api_base,
+                    plan,
+                    provider,
+                    selected.api_key(),
+                    dashscope_streaming.as_ref(),
+                )?)
+            } else {
+                let mut session_params = params.clone();
+                session_params.insert(
+                    "channels".to_string(),
+                    QueryValue::Single(plan.upstream_request_channels(channels).to_string()),
+                );
+
+                let upstream_urls = match plan.upstream_count() {
+                    1 => vec![
+                        init_session(state, selected, header_name, &session_params)
+                            .await
+                            .map_err(ProxyBuildError::SessionInitFailed)?,
+                    ],
+                    2 => {
+                        let (url_mic, url_spk) = tokio::try_join!(
+                            init_session(state, selected, header_name, &session_params),
+                            init_session(state, selected, header_name, &session_params),
+                        )
+                        .map_err(ProxyBuildError::SessionInitFailed)?;
+                        vec![url_mic, url_spk]
+                    }
+                    count => {
+                        return Err(ProxyBuildError::ProxyError(
+                            crate::ProxyError::InvalidRequest(format!(
+                                "unsupported upstream count: {count}"
+                            )),
+                        ));
+                    }
+                };
+
+                Ok(plan.build_from_upstream_urls(upstream_urls)?)
+            }
+        }
+        _ => Ok(build_proxy_with_adapter(
+            &listen_params,
+            channels,
+            api_base,
+            plan,
+            provider,
+            selected.api_key(),
+            dashscope_streaming.as_ref(),
+        )?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query_params::QueryValue;
+    use anlg_language::ISO639;
+
+    #[test]
+    fn build_listen_params_parses_and_normalizes_query() {
+        let mut params = QueryParams::default();
+        params.insert(
+            "model".to_string(),
+            QueryValue::Single("nova-3".to_string()),
+        );
+        params.insert("language".to_string(), QueryValue::Single("en".to_string()));
+        params.insert(
+            "sample_rate".to_string(),
+            QueryValue::Single("16000".to_string()),
+        );
+        params.insert("channels".to_string(), QueryValue::Single("1".to_string()));
+
+        let listen_params = build_listen_params(&params);
+
+        assert_eq!(listen_params.model, Some("nova-3".to_string()));
+        assert_eq!(listen_params.languages.len(), 1);
+        assert_eq!(listen_params.languages[0].iso639(), ISO639::En);
+        assert_eq!(listen_params.sample_rate, 16000);
+        assert_eq!(listen_params.channels, 1);
+
+        let mut params = QueryParams::default();
+        params.insert(
+            "num_speakers".to_string(),
+            QueryValue::Single("3".to_string()),
+        );
+        params.insert(
+            "min_speakers".to_string(),
+            QueryValue::Single("2".to_string()),
+        );
+        params.insert(
+            "max_speakers".to_string(),
+            QueryValue::Single("4".to_string()),
+        );
+
+        let listen_params = build_listen_params(&params);
+
+        assert_eq!(listen_params.num_speakers, Some(3));
+        assert_eq!(listen_params.min_speakers, Some(2));
+        assert_eq!(listen_params.max_speakers, Some(4));
+
+        let mut params = QueryParams::default();
+        params.insert(
+            "keyword".to_string(),
+            QueryValue::Multi(vec!["Anarlog".to_string(), "transcription".to_string()]),
+        );
+
+        let listen_params = build_listen_params(&params);
+
+        assert_eq!(listen_params.keywords.len(), 2);
+        assert!(listen_params.keywords.contains(&"Anarlog".to_string()));
+        assert!(
+            listen_params
+                .keywords
+                .contains(&"transcription".to_string())
+        );
+
+        let params = QueryParams::default();
+        let listen_params = build_listen_params(&params);
+
+        assert_eq!(listen_params.model, None);
+        assert!(listen_params.languages.is_empty());
+        assert_eq!(listen_params.sample_rate, 16000);
+        assert_eq!(listen_params.channels, 1);
+        assert!(listen_params.keywords.is_empty());
+
+        let mut params = QueryParams::default();
+        params.insert(
+            "language".to_string(),
+            QueryValue::Multi(vec![
+                "en-US".to_string(),
+                "en-GB".to_string(),
+                "en".to_string(),
+                "ko-KR".to_string(),
+            ]),
+        );
+
+        let listen_params = build_listen_params(&params);
+
+        assert_eq!(listen_params.languages.len(), 2);
+        assert_eq!(listen_params.languages[0].iso639(), ISO639::En);
+        assert_eq!(listen_params.languages[0].region(), None);
+        assert_eq!(listen_params.languages[1].iso639(), ISO639::Ko);
+        assert_eq!(listen_params.languages[1].region(), Some("KR"));
+    }
+
+    #[test]
+    fn upstream_url_uses_provider_endpoint_and_model() {
+        let params = ListenParams {
+            model: Some("nova-3".to_string()),
+            languages: vec![ISO639::En.into()],
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+
+        let url = build_upstream_url_with_adapter(
+            Provider::Deepgram,
+            "https://api.deepgram.com/v1",
+            &params,
+            1,
+            None,
+        );
+
+        assert!(url.as_str().contains("deepgram.com"));
+        assert!(url.as_str().contains("model=nova-3"));
+
+        let params = ListenParams {
+            model: Some("flux-general-multi".to_string()),
+            languages: vec![ISO639::En.into(), ISO639::Ja.into()],
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+
+        let url = build_upstream_url_with_adapter(
+            Provider::Deepgram,
+            "https://api.deepgram.com/v1",
+            &params,
+            1,
+            None,
+        );
+
+        assert_eq!(url.path(), "/v2/listen");
+        assert!(url.as_str().contains("model=flux-general-multi"));
+        assert!(url.as_str().contains("language_hint=en"));
+        assert!(url.as_str().contains("language_hint=ja"));
+
+        let params = ListenParams {
+            model: Some("stt-rt-v3".to_string()),
+            languages: vec![ISO639::En.into()],
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+
+        let url = build_upstream_url_with_adapter(
+            Provider::Soniox,
+            "https://api.soniox.com",
+            &params,
+            1,
+            None,
+        );
+
+        assert!(url.as_str().contains("soniox.com"));
+    }
+
+    #[test]
+    fn initial_message_only_for_providers_that_need_it() {
+        let params = ListenParams {
+            model: Some("stt-v5".to_string()),
+            languages: vec![ISO639::En.into()],
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+
+        let initial_msg = build_initial_message_with_adapter(
+            Provider::Soniox,
+            Some("test-key"),
+            &params,
+            1,
+            None,
+        );
+
+        assert!(initial_msg.is_some());
+        let msg = initial_msg.unwrap();
+        assert!(msg.contains("api_key"));
+        assert!(msg.contains("test-key"));
+        assert!(msg.contains("stt-rt-v5"));
+
+        let params = ListenParams {
+            model: Some("nova-3".to_string()),
+            languages: vec![ISO639::En.into()],
+            ..Default::default()
+        };
+
+        let initial_msg = build_initial_message_with_adapter(
+            Provider::Deepgram,
+            Some("test-key"),
+            &params,
+            1,
+            None,
+        );
+
+        assert!(initial_msg.is_none());
+    }
+
+    #[test]
+    fn response_transformer_normalizes_provider_payloads() {
+        let transformer = build_response_transformer(Provider::Deepgram, Some("nova-3"));
+
+        let deepgram_response = r#"{
+            "type": "Results",
+            "channel_index": [0, 1],
+            "duration": 1.0,
+            "start": 0.0,
+            "is_final": true,
+            "speech_final": true,
+            "from_finalize": false,
+            "channel": {
+                "alternatives": [{
+                    "transcript": "hello world",
+                    "confidence": 0.95,
+                    "words": []
+                }]
+            },
+            "metadata": {
+                "request_id": "test",
+                "model_uuid": "test",
+                "model_info": {
+                    "name": "nova-3",
+                    "version": "1",
+                    "arch": "test"
+                }
+            }
+        }"#;
+
+        let result = transformer(deepgram_response);
+        assert!(result.is_some());
+
+        let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["type"], "Results");
+
+        let transformer =
+            build_response_transformer(Provider::Deepgram, Some("flux-general-multi"));
+        let result = transformer(
+            r#"{
+                "type": "TurnInfo",
+                "request_id": "test",
+                "event": "EndOfTurn",
+                "audio_window_start": 0.0,
+                "audio_window_end": 1.0,
+                "transcript": "hello",
+                "words": [
+                    {"word": "hello", "start": 0.0, "end": 0.5, "confidence": 0.9}
+                ],
+                "languages": ["en"]
+            }"#,
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(parsed["type"], "Results");
+        assert_eq!(parsed["channel"]["alternatives"][0]["transcript"], "hello");
+
+        let transformer = build_response_transformer(Provider::Soniox, None);
+
+        let result = transformer("{}");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn client_message_filter_translates_control_messages_per_provider() {
+        let cases = [
+            (
+                Provider::Deepgram,
+                Some("nova-3"),
+                r#"{"type":"KeepAlive"}"#,
+                Some(r#"{"type":"KeepAlive"}"#),
+            ),
+            (
+                Provider::Deepgram,
+                Some("nova-3"),
+                r#"{"type":"CloseStream"}"#,
+                None,
+            ),
+            (
+                Provider::Deepgram,
+                Some("nova-3"),
+                r#"{"type":"Finalize"}"#,
+                Some(r#"{"type":"Finalize"}"#),
+            ),
+            (
+                Provider::Deepgram,
+                Some("flux-general-multi"),
+                r#"{"type":"KeepAlive"}"#,
+                None,
+            ),
+            (
+                Provider::Deepgram,
+                Some("flux-general-multi"),
+                r#"{"type":"Finalize"}"#,
+                Some(r#"{"type":"CloseStream"}"#),
+            ),
+            (
+                Provider::Deepgram,
+                Some("flux-general-multi"),
+                r#"{"type":"CloseStream"}"#,
+                Some(r#"{"type":"CloseStream"}"#),
+            ),
+            (Provider::Soniox, None, r#"{"type":"CloseStream"}"#, None),
+            (
+                Provider::Soniox,
+                None,
+                r#"{"type":"KeepAlive"}"#,
+                Some(r#"{"type":"keepalive"}"#),
+            ),
+            (
+                Provider::Soniox,
+                None,
+                r#"{"type":"Finalize"}"#,
+                Some(r#"{"type":"finalize"}"#),
+            ),
+            (Provider::AssemblyAI, None, r#"{"type":"KeepAlive"}"#, None),
+            (
+                Provider::AssemblyAI,
+                None,
+                r#"{"type":"Finalize"}"#,
+                Some(r#"{"type":"Terminate"}"#),
+            ),
+            (Provider::Soniox, None, "not json", Some("not json")),
+        ];
+
+        for (provider, model, input, expected) in cases {
+            let filter = build_client_message_filter(provider, model, None);
+            assert_eq!(filter(input.to_string()).as_deref(), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_dashscope_streaming_uses_task_protocol_with_shared_task_id() {
+        let model = "qwen-audio-3.1-asr-flash-streaming";
+        let params = ListenParams {
+            model: Some(model.to_string()),
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+        let [adapter, spk_adapter] = dashscope_streaming_sessions(Provider::DashScope, Some(model))
+            .expect("streaming adapter");
+        assert_ne!(adapter.task_id(), spk_adapter.task_id());
+        assert!(
+            dashscope_streaming_sessions(Provider::DashScope, Some("qwen3-asr-flash-realtime"))
+                .is_none()
+        );
+
+        let url = build_upstream_url_with_adapter(
+            Provider::DashScope,
+            "wss://dashscope-intl.aliyuncs.com",
+            &params,
+            1,
+            Some(&adapter),
+        );
+        assert_eq!(url.path(), "/api-ws/v1/inference");
+        assert!(url.as_str().contains(&format!("model={model}")));
+
+        let workspace_host = "ws-o27c8mbs9cfv6xxo.ap-southeast-1.maas.aliyuncs.com";
+        let workspace_base = format!("https://{workspace_host}");
+        let url = build_upstream_url_with_adapter(
+            Provider::DashScope,
+            &workspace_base,
+            &params,
+            1,
+            Some(&adapter),
+        );
+        assert_eq!(url.scheme(), "wss");
+        assert_eq!(url.host_str(), Some(workspace_host));
+        assert_eq!(url.path(), "/api-ws/v1/inference");
+
+        let legacy_params = ListenParams {
+            model: Some("qwen3-asr-flash-realtime".to_string()),
+            ..params.clone()
+        };
+        let url = build_upstream_url_with_adapter(
+            Provider::DashScope,
+            &workspace_base,
+            &legacy_params,
+            1,
+            None,
+        );
+        assert_eq!(url.host_str(), Some(workspace_host));
+        assert_eq!(url.path(), "/api-ws/v1/realtime");
+
+        let initial = build_initial_message_with_adapter(
+            Provider::DashScope,
+            Some("test-key"),
+            &params,
+            1,
+            Some(&adapter),
+        )
+        .expect("initial message");
+        let initial: serde_json::Value = serde_json::from_str(&initial).unwrap();
+        assert_eq!(initial["header"]["action"], "run-task");
+        assert_eq!(initial["header"]["task_id"], adapter.task_id());
+
+        let filter =
+            build_client_message_filter(Provider::DashScope, Some(model), Some(adapter.clone()));
+        assert_eq!(filter(r#"{"type":"KeepAlive"}"#.to_string()), None);
+        let finish: serde_json::Value =
+            serde_json::from_str(&filter(r#"{"type":"Finalize"}"#.to_string()).unwrap()).unwrap();
+        assert_eq!(finish["header"]["action"], "finish-task");
+        assert_eq!(finish["header"]["task_id"], adapter.task_id());
+
+        let spk_initial = build_initial_message_with_adapter(
+            Provider::DashScope,
+            Some("test-key"),
+            &params,
+            1,
+            Some(&spk_adapter),
+        )
+        .expect("speaker initial message");
+        let spk_initial: serde_json::Value = serde_json::from_str(&spk_initial).unwrap();
+        assert_eq!(spk_initial["header"]["task_id"], spk_adapter.task_id());
+        let spk_filter = build_client_message_filter(
+            Provider::DashScope,
+            Some(model),
+            Some(spk_adapter.clone()),
+        );
+        let spk_finish: serde_json::Value =
+            serde_json::from_str(&spk_filter(r#"{"type":"Finalize"}"#.to_string()).unwrap())
+                .unwrap();
+        assert_eq!(spk_finish["header"]["task_id"], spk_adapter.task_id());
+
+        let readiness = upstream_readiness_for(&adapter).expect("readiness");
+        assert!(readiness.matches(r#"{"header":{"event":"task-started"}}"#));
+        assert!(!readiness.matches(r#"{"header":{"event":"result-generated"}}"#));
+
+        let completion = dashscope_upstream_completion();
+        assert!(completion.matches(r#"{"header":{"event":"task-finished"}}"#));
+        assert!(!completion.matches(r#"{"header":{"event":"task-started"}}"#));
+
+        let legacy_filter = build_client_message_filter(
+            Provider::DashScope,
+            Some("qwen3-asr-flash-realtime"),
+            None,
+        );
+        assert_eq!(
+            legacy_filter(r#"{"type":"Finalize"}"#.to_string()),
+            Some(r#"{"type":"session.finish"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_client_binary_message_mapper_elevenlabs_wraps_audio_chunks() {
+        assert!(build_client_binary_message_mapper(Provider::Deepgram, 16_000).is_none());
+
+        let mapper = build_client_binary_message_mapper(Provider::ElevenLabs, 16_000).unwrap();
+        let Some(ClientBinaryMessage::Text(text)) = mapper(vec![1, 2, 3]) else {
+            panic!("expected ElevenLabs binary audio to map to text JSON");
+        };
+
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["message_type"], "input_audio_chunk");
+        assert_eq!(parsed["audio_base_64"], "AQID");
+    }
+
+    #[test]
+    fn test_client_binary_message_mapper_openai_encodes_resampled_audio() {
+        let mapper = build_client_binary_message_mapper(Provider::OpenAI, 16_000).unwrap();
+        let input = (0..160_i16).flat_map(i16::to_le_bytes).collect::<Vec<_>>();
+        let Some(ClientBinaryMessage::Text(text)) = mapper(input) else {
+            panic!("expected OpenAI binary audio to map to text JSON");
+        };
+
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["type"], "input_audio_buffer.append");
+        let output = base64::engine::general_purpose::STANDARD
+            .decode(parsed["audio"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(output.len(), 240 * std::mem::size_of::<i16>());
+    }
+
+    #[test]
+    fn resolve_model_live_handles_meta_explicit_and_missing_models() {
+        let mut params = ListenParams {
+            model: Some("cloud".to_string()),
+            languages: vec![ISO639::Ko.into(), ISO639::En.into()],
+            sample_rate: 16000,
+            ..Default::default()
+        };
+
+        resolve_model_live(Provider::Soniox, &mut params);
+        assert_eq!(params.model, None);
+
+        let mut params = ListenParams {
+            model: Some("cloud".to_string()),
+            languages: vec![ISO639::En.into()],
+            sample_rate: 16000,
+            ..Default::default()
+        };
+
+        resolve_model_live(Provider::Deepgram, &mut params);
+        assert!(params.model.is_some());
+        assert_ne!(params.model.as_deref(), Some("cloud"));
+
+        let mut params = ListenParams {
+            model: Some("nova-3".to_string()),
+            languages: vec![ISO639::En.into()],
+            sample_rate: 16000,
+            ..Default::default()
+        };
+
+        resolve_model_live(Provider::Deepgram, &mut params);
+        assert_eq!(params.model, Some("nova-3".to_string()));
+
+        let mut params = ListenParams {
+            model: None,
+            languages: vec![ISO639::En.into()],
+            sample_rate: 16000,
+            ..Default::default()
+        };
+
+        resolve_model_live(Provider::Deepgram, &mut params);
+        assert!(params.model.is_some());
+    }
+}

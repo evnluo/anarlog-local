@@ -1,0 +1,615 @@
+import type { Segment, SegmentKey } from "~/stt/live-segment";
+
+type TranscriptWordSelectionGroup = {
+  transcriptId: string;
+  segmentKey: SegmentKey;
+  inferredHumanId?: string;
+  wordIds: string[];
+};
+
+export type TranscriptWordSelection = {
+  sessionId?: string;
+  text: string;
+  startMs: number;
+  groups: TranscriptWordSelectionGroup[];
+};
+
+export function getTranscriptSelectionFromRange(
+  range: Range,
+  container: HTMLElement,
+): TranscriptWordSelection | null {
+  if (range.collapsed || !container.contains(range.commonAncestorContainer)) {
+    return null;
+  }
+
+  const groups = new Map<string, TranscriptWordSelectionGroup>();
+  let sessionId: string | undefined;
+  let startMs: number | undefined;
+
+  for (const wordElement of container.querySelectorAll<HTMLElement>(
+    "[data-transcript-word-id]",
+  )) {
+    if (!rangeIntersectsNode(range, wordElement)) {
+      continue;
+    }
+
+    const wordId = wordElement.dataset.transcriptWordId;
+    const segmentElement = wordElement.closest<HTMLElement>(
+      "[data-transcript-id]",
+    );
+    const transcriptId = segmentElement?.dataset.transcriptId;
+    const segmentKey = segmentElement
+      ? readSegmentKey(segmentElement)
+      : undefined;
+    if (!wordId || !transcriptId || !segmentKey) {
+      continue;
+    }
+
+    addWordToSelection(groups, transcriptId, segmentKey, wordId);
+    sessionId ??= segmentElement?.dataset.sessionId || undefined;
+    startMs ??= readWordStartMs(wordElement, segmentElement);
+  }
+
+  for (const editorElement of container.querySelectorAll<HTMLElement>(
+    "[data-transcript-edit-word-ids]",
+  )) {
+    if (!rangeIntersectsNode(range, editorElement)) {
+      continue;
+    }
+
+    const segmentElement = editorElement.closest<HTMLElement>(
+      "[data-transcript-id]",
+    );
+    const transcriptId = segmentElement?.dataset.transcriptId;
+    const segmentKey = segmentElement
+      ? readSegmentKey(segmentElement)
+      : undefined;
+    if (!transcriptId || !segmentKey) {
+      continue;
+    }
+
+    const wordIds = parseStringArray(
+      editorElement.dataset.transcriptEditWordIds,
+    );
+    const wordTexts = parseStringArray(
+      editorElement.dataset.transcriptEditWordTexts,
+    );
+    const wordStartMs = parseNumberArray(
+      editorElement.dataset.transcriptEditWordStartMs,
+    );
+    const selectedIndices = getSelectedEditableWordIndices(
+      range,
+      editorElement,
+      wordTexts,
+    );
+    for (const index of selectedIndices) {
+      const wordId = wordIds[index];
+      if (!wordId) {
+        continue;
+      }
+      addWordToSelection(groups, transcriptId, segmentKey, wordId);
+      sessionId ??= segmentElement?.dataset.sessionId || undefined;
+      startMs ??=
+        (wordStartMs[index] ?? 0) +
+        Number(segmentElement?.dataset.transcriptOffsetMs ?? 0);
+    }
+  }
+
+  if (groups.size === 0) {
+    return null;
+  }
+
+  return {
+    sessionId,
+    text: range.toString().trim(),
+    startMs: startMs ?? 0,
+    groups: [...groups.values()],
+  };
+}
+
+export function getTranscriptContextSelection({
+  target,
+  container,
+  activeRange,
+}: {
+  target: EventTarget | null;
+  container: HTMLElement;
+  activeRange?: Range;
+}): { range: Range; selection: TranscriptWordSelection } | null {
+  if (!(target instanceof Element)) {
+    return null;
+  }
+
+  const selectionTarget = target.closest<HTMLElement>(
+    "[data-transcript-word-id], [data-transcript-editor]",
+  );
+  if (!selectionTarget || !container.contains(selectionTarget)) {
+    return null;
+  }
+
+  if (
+    activeRange &&
+    !activeRange.collapsed &&
+    rangeIntersectsNode(activeRange, selectionTarget)
+  ) {
+    const selection = getTranscriptSelectionFromRange(activeRange, container);
+    if (selection) {
+      return { range: activeRange.cloneRange(), selection };
+    }
+  }
+
+  const segmentContent = selectionTarget.closest<HTMLElement>(
+    "[data-transcript-segment-content]",
+  );
+  if (!segmentContent) {
+    return null;
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(segmentContent);
+  const selection = getTranscriptSelectionFromRange(range, container);
+  return selection ? { range, selection } : null;
+}
+
+export function getTranscriptSegmentDomId(
+  transcriptId: string,
+  segment: Pick<Segment, "id" | "start_ms" | "end_ms" | "words">,
+) {
+  return (
+    segment.id ||
+    `${transcriptId}:${segment.words[0]?.id ?? segment.start_ms}:${segment.words[segment.words.length - 1]?.id ?? segment.end_ms}`
+  );
+}
+
+export function getTranscriptSectionKey(
+  transcriptId: string,
+  segmentId: string,
+) {
+  return `${transcriptId}:${segmentId}`;
+}
+
+export function getTranscriptSectionKeyFromElement(section: HTMLElement) {
+  const transcriptId = section.dataset.transcriptId;
+  const segmentId = section.dataset.transcriptSegmentId;
+  return transcriptId && segmentId
+    ? getTranscriptSectionKey(transcriptId, segmentId)
+    : null;
+}
+
+export function getTranscriptSelectionFromSegment({
+  transcriptId,
+  sessionId,
+  offsetMs,
+  segment,
+}: {
+  transcriptId: string;
+  sessionId?: string;
+  offsetMs: number;
+  segment: Pick<Segment, "key" | "text" | "words" | "provisional_speaker">;
+}): TranscriptWordSelection | null {
+  const wordIds = segment.words
+    .map((word) => word.id)
+    .filter(
+      (wordId): wordId is string =>
+        typeof wordId === "string" && wordId.length > 0,
+    );
+  if (wordIds.length === 0) {
+    return null;
+  }
+
+  return {
+    sessionId,
+    text: segment.text.trim(),
+    startMs: offsetMs + (segment.words[0]?.start_ms ?? 0),
+    groups: [
+      {
+        transcriptId,
+        segmentKey: segment.key,
+        ...(segment.provisional_speaker?.human_id
+          ? { inferredHumanId: segment.provisional_speaker.human_id }
+          : {}),
+        wordIds,
+      },
+    ],
+  };
+}
+
+export function getTranscriptSectionSelection(
+  section: HTMLElement,
+  container: HTMLElement,
+): TranscriptWordSelection | null {
+  const content = section.querySelector<HTMLElement>(
+    "[data-transcript-segment-content]",
+  );
+  if (!content) {
+    return null;
+  }
+
+  const range = document.createRange();
+  range.selectNodeContents(content);
+  return getTranscriptSelectionFromRange(range, container);
+}
+
+export function mergeTranscriptSelections(
+  selections: TranscriptWordSelection[],
+): TranscriptWordSelection | null {
+  if (selections.length === 0) {
+    return null;
+  }
+
+  const groups = new Map<string, TranscriptWordSelectionGroup>();
+  for (const selection of selections) {
+    for (const nextGroup of selection.groups) {
+      const group = groups.get(nextGroup.transcriptId) ?? {
+        transcriptId: nextGroup.transcriptId,
+        segmentKey: nextGroup.segmentKey,
+        wordIds: [],
+      };
+      for (const wordId of nextGroup.wordIds) {
+        if (!group.wordIds.includes(wordId)) {
+          group.wordIds.push(wordId);
+        }
+      }
+      groups.set(nextGroup.transcriptId, group);
+    }
+  }
+
+  return {
+    sessionId: selections.find((selection) => selection.sessionId)?.sessionId,
+    text: selections.map((selection) => selection.text).join("\n\n"),
+    startMs: Math.min(...selections.map((selection) => selection.startMs)),
+    groups: [...groups.values()],
+  };
+}
+
+const LIVE_TRANSCRIPT_PLACEHOLDER_ID = "__live-transcript__";
+
+export function canMergeTranscriptEntries(
+  selectedKeys: ReadonlySet<string>,
+  order: string[],
+  entries: Map<string, TranscriptWordSelection>,
+) {
+  return getTranscriptMergeTarget(selectedKeys, order, entries) != null;
+}
+
+export function getTranscriptMergeTarget(
+  selectedKeys: ReadonlySet<string>,
+  order: string[],
+  entries: Map<string, TranscriptWordSelection>,
+) {
+  if (selectedKeys.size < 2) {
+    return null;
+  }
+
+  const indexes = order.flatMap((key, index) =>
+    selectedKeys.has(key) ? [index] : [],
+  );
+  if (indexes.length !== selectedKeys.size) {
+    return null;
+  }
+
+  for (let index = 1; index < indexes.length; index += 1) {
+    if (indexes[index] !== indexes[index - 1]! + 1) {
+      return null;
+    }
+  }
+
+  const firstKey = order[indexes[0]!];
+  const first = firstKey ? (entries.get(firstKey) ?? null) : null;
+  const targetGroup = first?.groups[0];
+  if (!first || !targetGroup) {
+    return null;
+  }
+  if (targetGroup.transcriptId === LIVE_TRANSCRIPT_PLACEHOLDER_ID) {
+    return null;
+  }
+  if (
+    !targetGroup.segmentKey.speaker_human_id &&
+    !targetGroup.inferredHumanId &&
+    typeof targetGroup.segmentKey.speaker_index !== "number"
+  ) {
+    return null;
+  }
+
+  for (const index of indexes) {
+    const group = entries.get(order[index]!)?.groups[0];
+    if (
+      !group ||
+      group.transcriptId !== targetGroup.transcriptId ||
+      group.segmentKey.channel !== targetGroup.segmentKey.channel
+    ) {
+      return null;
+    }
+  }
+
+  if (!targetGroup.segmentKey.speaker_human_id && targetGroup.inferredHumanId) {
+    return {
+      ...first,
+      groups: [
+        {
+          ...targetGroup,
+          segmentKey: {
+            ...targetGroup.segmentKey,
+            speaker_human_id: targetGroup.inferredHumanId,
+          },
+        },
+      ],
+    };
+  }
+  return first;
+}
+
+function readSegmentKey(element: HTMLElement): SegmentKey | undefined {
+  const channel = element.dataset.segmentChannel;
+  if (
+    channel !== "DirectMic" &&
+    channel !== "RemoteParty" &&
+    channel !== "MixedCapture"
+  ) {
+    return undefined;
+  }
+
+  const speakerIndexValue = element.dataset.segmentSpeakerIndex;
+  const speakerIndex =
+    speakerIndexValue === undefined || speakerIndexValue === ""
+      ? null
+      : Number(speakerIndexValue);
+
+  return {
+    channel,
+    speaker_index: Number.isFinite(speakerIndex) ? speakerIndex : null,
+    speaker_human_id: element.dataset.segmentSpeakerHumanId || null,
+  };
+}
+
+function addWordToSelection(
+  groups: Map<string, TranscriptWordSelectionGroup>,
+  transcriptId: string,
+  segmentKey: SegmentKey,
+  wordId: string,
+) {
+  const group = groups.get(transcriptId) ?? {
+    transcriptId,
+    segmentKey,
+    wordIds: [],
+  };
+  if (!group.wordIds.includes(wordId)) {
+    group.wordIds.push(wordId);
+  }
+  groups.set(transcriptId, group);
+}
+
+function getSelectedEditableWordIndices(
+  range: Range,
+  editor: HTMLElement,
+  wordTexts: string[],
+) {
+  const offsets = getRangeOffsets(range, editor);
+  if (!offsets) {
+    return [];
+  }
+
+  const indices: number[] = [];
+  let cursor = 0;
+  for (const [index, wordText] of wordTexts.entries()) {
+    const start = cursor;
+    const end = start + wordText.length;
+    if (offsets.start < end && offsets.end > start) {
+      indices.push(index);
+    }
+    cursor = end + 1;
+  }
+  return indices;
+}
+
+function getRangeOffsets(range: Range, container: HTMLElement) {
+  if (
+    !container.contains(range.startContainer) ||
+    !container.contains(range.endContainer)
+  ) {
+    return null;
+  }
+
+  const beforeStart = document.createRange();
+  beforeStart.selectNodeContents(container);
+  beforeStart.setEnd(range.startContainer, range.startOffset);
+  const beforeEnd = document.createRange();
+  beforeEnd.selectNodeContents(container);
+  beforeEnd.setEnd(range.endContainer, range.endOffset);
+  return {
+    start: beforeStart.toString().length,
+    end: beforeEnd.toString().length,
+  };
+}
+
+function parseStringArray(value: string | undefined): string[] {
+  try {
+    const parsed = JSON.parse(value ?? "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseNumberArray(value: string | undefined): number[] {
+  try {
+    const parsed = JSON.parse(value ?? "[]");
+    return Array.isArray(parsed)
+      ? parsed.map((item) => (typeof item === "number" ? item : 0))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function readWordStartMs(
+  wordElement: HTMLElement,
+  segmentElement: HTMLElement | null,
+) {
+  const wordStartMs = Number(wordElement.dataset.transcriptWordStartMs ?? 0);
+  const transcriptOffsetMs = Number(
+    segmentElement?.dataset.transcriptOffsetMs ?? 0,
+  );
+  return wordStartMs + transcriptOffsetMs;
+}
+
+function rangeIntersectsNode(range: Range, node: Node) {
+  try {
+    return range.intersectsNode(node);
+  } catch {
+    return false;
+  }
+}
+
+export function isRangeCoveredBySelection(
+  range: Range,
+  selection: Selection | null,
+) {
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return false;
+  }
+
+  try {
+    const native = selection.getRangeAt(0);
+    return (
+      native.compareBoundaryPoints(Range.START_TO_START, range) <= 0 &&
+      native.compareBoundaryPoints(Range.END_TO_END, range) >= 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Range.getClientRects() returns the box of every fully selected element plus
+// the boxes of the text inside it, so word spans would be painted twice.
+export function getTranscriptRangeRects(range: Range): DOMRect[] {
+  const rects: DOMRect[] = [];
+  const textRange = document.createRange();
+
+  for (const node of getRangeTextNodes(range)) {
+    textRange.selectNodeContents(node);
+    if (node === range.startContainer) {
+      textRange.setStart(node, range.startOffset);
+    }
+    if (node === range.endContainer) {
+      textRange.setEnd(node, range.endOffset);
+    }
+
+    for (const rect of Array.from(textRange.getClientRects())) {
+      if (rect.width > 0 && rect.height > 0) {
+        appendLineRect(rects, rect);
+      }
+    }
+  }
+
+  return rects;
+}
+
+function getRangeTextNodes(range: Range): Node[] {
+  const root = range.commonAncestorContainer;
+  if (root.nodeType === Node.TEXT_NODE) {
+    return [root];
+  }
+
+  const nodes: Node[] = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (rangeIntersectsNode(range, node)) {
+      nodes.push(node);
+    }
+  }
+  return nodes;
+}
+
+function appendLineRect(rects: DOMRect[], rect: DOMRect) {
+  const last = rects[rects.length - 1];
+  const continuesLine =
+    last !== undefined &&
+    Math.abs(last.top - rect.top) < 1 &&
+    Math.abs(last.height - rect.height) < 1 &&
+    rect.left >= last.left &&
+    rect.left <= last.right + 1;
+  if (!continuesLine) {
+    rects.push(rect);
+    return;
+  }
+
+  rects[rects.length - 1] = new DOMRect(
+    last.left,
+    last.top,
+    Math.max(last.right, rect.right) - last.left,
+    last.height,
+  );
+}
+
+export function focusTranscriptSelection(
+  selection: TranscriptWordSelection,
+  container: HTMLElement,
+) {
+  const group = selection.groups[0];
+  if (!group) return;
+  for (const editor of container.querySelectorAll<HTMLElement>(
+    "[data-transcript-editor]",
+  )) {
+    if (
+      editor.closest<HTMLElement>("[data-transcript-id]")?.dataset
+        .transcriptId !== group.transcriptId
+    )
+      continue;
+    const ids = parseStringArray(editor.dataset.transcriptEditWordIds);
+    const start = ids.indexOf(group.wordIds[0]);
+    if (start < 0) continue;
+    const texts = parseStringArray(editor.dataset.transcriptEditWordTexts);
+    const end = Math.max(
+      start,
+      ids.indexOf(group.wordIds[group.wordIds.length - 1]),
+    );
+    editor.focus({ preventScroll: true });
+    const text = editor.firstChild;
+    if (text?.nodeType === Node.TEXT_NODE) {
+      const range = document.createRange();
+      const startOffset =
+        texts.slice(0, start).join(" ").length + (start > 0 ? 1 : 0);
+      const endOffset = texts.slice(0, end + 1).join(" ").length;
+      range.setStart(
+        text,
+        Math.min(startOffset, text.textContent?.length ?? 0),
+      );
+      range.setEnd(text, Math.min(endOffset, text.textContent?.length ?? 0));
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+    }
+    return editor;
+  }
+}
+
+export function getTranscriptSelectionFromHere(
+  selection: TranscriptWordSelection,
+  entries: Iterable<TranscriptWordSelection>,
+): TranscriptWordSelection | null {
+  const anchor = selection.groups[0];
+  if (!anchor) return null;
+  for (const entry of entries) {
+    const group = entry.groups.find(
+      (group) =>
+        group.transcriptId === anchor.transcriptId &&
+        group.wordIds.includes(anchor.wordIds[0]),
+    );
+    if (group) {
+      return {
+        ...entry,
+        groups: [
+          {
+            ...group,
+            wordIds: group.wordIds.slice(
+              group.wordIds.indexOf(anchor.wordIds[0]),
+            ),
+          },
+        ],
+      };
+    }
+  }
+  return null;
+}
