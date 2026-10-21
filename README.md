@@ -56,7 +56,7 @@ pnpm --filter @anlg/desktop tauri build \
   --target aarch64-apple-darwin --bundles app,dmg
 ```
 
-The reproducible CI recipe is `.github/workflows/macos-arm64.yml`. It uses a standard free public-repository `macos-15` ARM64 runner, no secrets, no Apple developer identity, and no upstream signing or updater keys.
+The reproducible CI recipe is `.github/workflows/macos-arm64.yml`. It uses a standard free public-repository `macos-26` ARM64 runner, no secrets, no Apple developer identity, and no upstream signing or updater keys.
 
 ## Testing status
 
