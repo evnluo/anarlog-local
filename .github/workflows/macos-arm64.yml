@@ -117,6 +117,8 @@ jobs:
           apps/desktop/src/onboarding/welcome-note.test.ts
           apps/desktop/src/onboarding/welcome-note.ts
           apps/desktop/src/provider-boundary.test.tsx
+          apps/desktop/src/session-sharing/attachments.test.ts
+          apps/desktop/src/session/attachments.test.ts
           apps/desktop/src/session/components/outer-header/index.tsx
           apps/desktop/src/settings/ai/llm/shared.tsx
           apps/desktop/src/settings/ai/stt/shared.tsx

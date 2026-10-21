@@ -31,6 +31,7 @@ import {
   isWorkflowStepReady,
   type AutomationWorkflow,
   type WorkflowStep,
+  type WorkflowTrigger,
   type WorkflowStepType,
 } from "~/automations/workflows";
 

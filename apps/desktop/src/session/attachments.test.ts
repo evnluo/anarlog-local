@@ -107,7 +107,7 @@ describe("attachment catalog", () => {
   });
 
   it("computes a stable lowercase SHA-256 checksum", async () => {
-    const bytes = new TextEncoder().encode("hello").buffer;
+    const bytes = new TextEncoder().encode("hello").buffer as ArrayBuffer;
 
     await expect(sha256Hex(bytes)).resolves.toBe(
       "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",

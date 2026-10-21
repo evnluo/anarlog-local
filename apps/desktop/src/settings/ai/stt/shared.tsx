@@ -1286,7 +1286,7 @@ const PROVIDER_ORDER = [
   "aquavoice",
 ] as const;
 
-export const PROVIDERS: Provider[] = sortProviders(
+export const PROVIDERS = sortProviders(
   _PROVIDERS.filter((provider) => provider.id !== "anarlog"),
   PROVIDER_ORDER,
 );

@@ -52,7 +52,7 @@ export type StarterAutomation = {
 export function useStarterAutomations(): StarterAutomation[] {
   const { t } = useLingui();
 
-  return [
+  return ([
     {
       id: "google-drive",
       title: t`Save meetings to Google Drive`,
@@ -208,5 +208,7 @@ export function useStarterAutomations(): StarterAutomation[] {
       ],
       preview: t`A Markdown file with the note, summary, and transcript.`,
     },
-  ].filter((starter) => starter.id === "markdown-export");
+  ] satisfies StarterAutomation[]).filter(
+    (starter) => starter.id === "markdown-export",
+  );
 }

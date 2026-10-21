@@ -34,7 +34,6 @@ export function FinalDescription() {
       </span>
       <div className="flex items-center gap-2">
         {SOCIALS.map((social) => {
-          const iconSize = "size" in social ? social.size : SOCIAL_ICON_SIZE;
           const SocialIcon = social.icon;
 
           return (
@@ -44,7 +43,7 @@ export function FinalDescription() {
               className="text-muted-foreground hover:text-muted-foreground inline-flex size-5 items-center justify-center rounded-md transition-colors duration-150"
               aria-label={social.label}
             >
-              <SocialIcon size={iconSize} />
+              <SocialIcon size={SOCIAL_ICON_SIZE} />
             </button>
           );
         })}

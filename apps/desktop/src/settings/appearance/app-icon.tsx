@@ -3,7 +3,6 @@ import { useQuery } from "@tanstack/react-query";
 import { getIdentifier } from "@tauri-apps/api/app";
 import { platform } from "@tauri-apps/plugin-os";
 
-import { CircleNotch } from "@anlg/ui/components/icons";
 import { cn } from "@anlg/utils";
 
 import { useSetSettingValue } from "~/settings/queries";

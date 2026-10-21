@@ -345,7 +345,7 @@ describe("shared attachment selection", () => {
         uploadToken: "signed-token",
       });
     });
-    let finishRead!: (bytes: Uint8Array) => void;
+    let finishRead!: (bytes: Uint8Array<ArrayBuffer>) => void;
     const native = {
       prepareSharedUpload: vi.fn().mockResolvedValue({
         cacheId: "44444444-4444-4444-8444-444444444444",
@@ -354,7 +354,7 @@ describe("shared attachment selection", () => {
       }),
       readSharedUploadRange: vi.fn(
         () =>
-          new Promise<Uint8Array>((resolve) => {
+          new Promise<Uint8Array<ArrayBuffer>>((resolve) => {
             finishRead = resolve;
           }),
       ),
