@@ -59,11 +59,7 @@ mod tests {
         let temp = tempdir().unwrap();
         for folder in [RELEASE_APP_FOLDER, LEGACY_RELEASE_APP_FOLDER] {
             std::fs::create_dir(temp.path().join(folder)).unwrap();
-            std::fs::write(
-                temp.path().join(folder).join("app.db"),
-                "official data",
-            )
-            .unwrap();
+            std::fs::write(temp.path().join(folder).join("app.db"), "official data").unwrap();
         }
 
         assert_eq!(
