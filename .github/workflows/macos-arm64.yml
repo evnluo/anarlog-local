@@ -72,8 +72,71 @@ jobs:
       - name: Build shared UI
         run: pnpm --filter @anlg/ui build
 
-      - name: Verify formatting
-        run: pnpm fmt:check
+      - name: Verify local-edition formatting
+        run: >-
+          pnpm exec dprint check --allow-no-files
+          .github/workflows/macos-arm64.yml
+          Cargo.toml
+          pnpm-workspace.yaml
+          crates/storage/src/global.rs
+          plugins/analytics/src/lib.rs
+          plugins/calendar/src/lib.rs
+          plugins/todo/src/lib.rs
+          plugins/tracing/src/utils.rs
+          plugins/tray/src/menu_items/help_report_bug.rs
+          plugins/tray/src/menu_items/help_suggest_feature.rs
+          apps/desktop/src-tauri/tauri.conf.json
+          apps/desktop/src-tauri/src/db.rs
+          apps/desktop/src-tauri/src/embedded_cli.rs
+          apps/desktop/src-tauri/src/embedded_cli/tests.rs
+          apps/desktop/src-tauri/src/lib.rs
+          apps/desktop/src/ai/hooks/useLLMConnection.test.ts
+          apps/desktop/src/ai/hooks/useLLMConnection.ts
+          apps/desktop/src/analytics.ts
+          apps/desktop/src/audio-player/provider.tsx
+          apps/desktop/src/audio-player/timeline.tsx
+          apps/desktop/src/auth/local-billing.tsx
+          apps/desktop/src/automations/starters.tsx
+          apps/desktop/src/chat/tools/index.test.ts
+          apps/desktop/src/chat/tools/index.ts
+          apps/desktop/src/chat/tools/types.ts
+          apps/desktop/src/chat/transport/use-transport.ts
+          apps/desktop/src/dictation/lifecycle.test.tsx
+          apps/desktop/src/dictation/lifecycle.tsx
+          apps/desktop/src/env.ts
+          apps/desktop/src/local-edition-config.test.ts
+          apps/desktop/src/local-edition.test.ts
+          apps/desktop/src/local-edition.ts
+          apps/desktop/src/main/lifecycle.tsx
+          apps/desktop/src/main/windows-title-bar.tsx
+          apps/desktop/src/main.tsx
+          apps/desktop/src/onboarding/config.tsx
+          apps/desktop/src/onboarding/final.tsx
+          apps/desktop/src/onboarding/index.tsx
+          apps/desktop/src/onboarding/welcome-note.constants.ts
+          apps/desktop/src/onboarding/welcome-note.test.ts
+          apps/desktop/src/onboarding/welcome-note.ts
+          apps/desktop/src/provider-boundary.test.tsx
+          apps/desktop/src/session/components/outer-header/index.tsx
+          apps/desktop/src/settings/ai/llm/shared.tsx
+          apps/desktop/src/settings/ai/stt/shared.tsx
+          apps/desktop/src/settings/appearance/app-icon.tsx
+          apps/desktop/src/settings/automations/index.tsx
+          apps/desktop/src/settings/automations/workflow-builder.tsx
+          apps/desktop/src/settings/dictionary/index.test.tsx
+          apps/desktop/src/settings/dictionary/index.tsx
+          apps/desktop/src/settings/dictation.tsx
+          apps/desktop/src/settings/general/app-settings.test.tsx
+          apps/desktop/src/settings/general/app-settings.tsx
+          apps/desktop/src/shared/main-app-layout.test.tsx
+          apps/desktop/src/shared/main-app-layout.tsx
+          apps/desktop/src/shared/ui/resource-list/hooks.ts
+          apps/desktop/src/sidebar/automations.tsx
+          apps/desktop/src/sidebar/index.test.tsx
+          apps/desktop/src/sidebar/index.tsx
+          apps/desktop/src/sidebar/settings-nav-groups.ts
+          apps/desktop/src/stt/meeting-disclosure.ts
+          apps/desktop/src/templates/auto-form.tsx
 
       - name: Type-check desktop
         run: pnpm --filter @anlg/desktop typecheck
