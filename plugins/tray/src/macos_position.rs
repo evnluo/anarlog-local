@@ -91,7 +91,7 @@ pub fn apply_autosave_name(app: &tauri::AppHandle<tauri::Wry>, autosave_name: &'
         return;
     };
 
-    if let Err(error) = tray.with_inner_tray_icon(move |inner: &tray_icon::TrayIcon| {
+    if let Err(error) = tray.with_inner_tray_icon(move |inner| {
         let Some(item) = inner.ns_status_item() else {
             return;
         };

@@ -84,6 +84,7 @@ jobs:
           plugins/calendar/src/lib.rs
           plugins/todo/src/lib.rs
           plugins/tracing/src/utils.rs
+          plugins/tray/src/macos_position.rs
           plugins/tray/src/menu_items/help_report_bug.rs
           plugins/tray/src/menu_items/help_suggest_feature.rs
           apps/desktop/src-tauri/tauri.conf.json
