@@ -45,7 +45,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.94.0
+          toolchain: 1.96.0
           targets: aarch64-apple-darwin
           components: rustfmt,clippy
 
@@ -78,6 +78,7 @@ jobs:
           .github/workflows/macos-arm64.yml
           Cargo.toml
           pnpm-workspace.yaml
+          rust-toolchain.toml
           crates/storage/src/global.rs
           plugins/analytics/src/lib.rs
           plugins/calendar/src/lib.rs
