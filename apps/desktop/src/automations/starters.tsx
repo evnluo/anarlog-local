@@ -1,4 +1,3 @@
-import { Icon } from "@iconify-icon/react";
 import { useLingui } from "@lingui/react/macro";
 import type { ReactNode } from "react";
 
@@ -52,131 +51,7 @@ export type StarterAutomation = {
 export function useStarterAutomations(): StarterAutomation[] {
   const { t } = useLingui();
 
-  return ([
-    {
-      id: "google-drive",
-      title: t`Save meetings to Google Drive`,
-      description: t`Save meeting summaries and transcripts to a Google Drive folder.`,
-      renderIcon: (size) => (
-        <Icon
-          icon="logos:google-drive"
-          width={size}
-          height={size}
-          aria-hidden="true"
-        />
-      ),
-      steps: [
-        {
-          kind: "trigger",
-          title: t`Meeting ends`,
-          detail: t`Wait until the meeting recording ends.`,
-        },
-        {
-          kind: "ai",
-          title: t`Summary ready`,
-          detail: t`Runs once the AI summary for the meeting is ready.`,
-        },
-        {
-          kind: "action",
-          title: t`Upload to Google Drive folder`,
-          detail: t`Save the summary and transcript to the selected folder.`,
-        },
-      ],
-      preview: t`A Markdown file or Google document with the meeting summary and transcript.`,
-    },
-    {
-      id: "slack-recap",
-      title: t`Share a meeting recap in Slack`,
-      description: t`Post a meeting recap to a Slack channel.`,
-      renderIcon: (size) => (
-        <Icon
-          icon="logos:slack-icon"
-          width={size}
-          height={size}
-          aria-hidden="true"
-        />
-      ),
-      steps: [
-        {
-          kind: "trigger",
-          title: t`Meeting ends`,
-          detail: t`Runs once the AI summary for the meeting is ready.`,
-        },
-        {
-          kind: "ai",
-          title: t`Use the AI meeting summary`,
-          detail: t`Take the enhanced note with decisions and action items.`,
-        },
-        {
-          kind: "action",
-          title: t`Post to a channel`,
-          detail: t`Send the recap to the selected Slack channel.`,
-        },
-      ],
-      preview: t`A Slack message with the meeting title and recap.`,
-    },
-    {
-      id: "notion-project-notes",
-      title: t`Update project notes in Notion`,
-      description: t`Add meeting decisions and follow-ups to a Notion project.`,
-      renderIcon: (size) => (
-        <Icon
-          icon="logos:notion-icon"
-          width={size}
-          height={size}
-          aria-hidden="true"
-        />
-      ),
-      steps: [
-        {
-          kind: "trigger",
-          title: t`Meeting ends`,
-          detail: t`Runs once the AI summary for the meeting is ready.`,
-        },
-        {
-          kind: "ai",
-          title: t`Use the AI meeting summary`,
-          detail: t`Take the enhanced note with decisions and follow-ups.`,
-        },
-        {
-          kind: "action",
-          title: t`Append the meeting update`,
-          detail: t`Add a dated update to the selected Notion page.`,
-        },
-      ],
-      preview: t`A dated Notion update with the meeting summary.`,
-    },
-    {
-      id: "linear-action-items",
-      title: t`Turn action items into Linear issues`,
-      description: t`Turn assigned follow-ups into Linear issue drafts.`,
-      renderIcon: (size) => (
-        <Icon
-          icon="logos:linear-icon"
-          width={size}
-          height={size}
-          aria-hidden="true"
-        />
-      ),
-      steps: [
-        {
-          kind: "trigger",
-          title: t`Meeting ends`,
-          detail: t`Runs once the AI summary for the meeting is ready.`,
-        },
-        {
-          kind: "ai",
-          title: t`Collect action items`,
-          detail: t`Use the meeting's action items and summary tasks.`,
-        },
-        {
-          kind: "action",
-          title: t`Create Linear issues`,
-          detail: t`File each action item as an issue in the selected team.`,
-        },
-      ],
-      preview: t`Linear issues created from meeting follow-ups.`,
-    },
+  return [
     {
       id: "markdown-export",
       title: t`Export every meeting as Markdown`,
@@ -208,7 +83,5 @@ export function useStarterAutomations(): StarterAutomation[] {
       ],
       preview: t`A Markdown file with the note, summary, and transcript.`,
     },
-  ] satisfies StarterAutomation[]).filter(
-    (starter) => starter.id === "markdown-export",
-  );
+  ];
 }
