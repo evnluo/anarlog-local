@@ -27,6 +27,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           lfs: true
           persist-credentials: false
 
@@ -238,7 +239,7 @@ jobs:
       - name: Upload verified macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: anarlog-local-macos-aarch64-${{ github.sha }}
+          name: anarlog-local-macos-aarch64-${{ github.event.pull_request.head.sha || github.sha }}
           path: dist/
           if-no-files-found: error
           retention-days: 7
