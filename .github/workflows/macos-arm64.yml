@@ -79,6 +79,11 @@ jobs:
           Cargo.toml
           pnpm-workspace.yaml
           rust-toolchain.toml
+          skills/anarlog/SKILL.md
+          skills/anarlog/references/cli.md
+          skills/anarlog/references/errors.md
+          skills/anarlog/references/mcp.md
+          skills/anarlog/references/setup.md
           crates/storage/src/global.rs
           plugins/analytics/src/lib.rs
           plugins/calendar/src/lib.rs
