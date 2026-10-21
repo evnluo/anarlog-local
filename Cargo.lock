@@ -15416,7 +15416,7 @@ dependencies = [
 [[package]]
 name = "swift-rs"
 version = "1.0.7"
-source = "git+https://github.com/Brendonovich/swift-rs?rev=41a1605#41a160524c737c061f5633e4371952544425aa01"
+source = "git+https://github.com/Brendonovich/swift-rs?rev=41a160524c737c061f5633e4371952544425aa01#41a160524c737c061f5633e4371952544425aa01"
 dependencies = [
  "base64 0.21.7",
  "serde",
