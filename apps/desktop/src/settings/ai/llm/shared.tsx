@@ -718,9 +718,7 @@ const PROVIDER_ORDER = [
 ] as const;
 
 export const PROVIDERS: Provider[] = sortProviders(
-  _PROVIDERS.filter(
-    (provider) => provider.id !== "anarlog" && provider.id !== "bedrock",
-  ),
+  _PROVIDERS.filter((provider) => provider.id !== "anarlog"),
   PROVIDER_ORDER,
 );
 export type ProviderId = (typeof _PROVIDERS)[number]["id"];

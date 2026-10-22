@@ -48,7 +48,6 @@
     "analytics:default",
     "attachment-sync:default",
     "agent:default",
-    "bedrock:default",
     "updater:default",
     "updater2:default",
     "deeplink2:default",
