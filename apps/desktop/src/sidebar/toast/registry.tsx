@@ -4,11 +4,7 @@ import type { ServerStatus } from "@anlg/plugin-local-stt";
 
 import type { DownloadProgress, ToastCondition, ToastType } from "./types";
 
-import type { DesktopUpdateControl } from "~/main/update-banner";
 import type { DevtoolsToastPreview } from "~/store/zustand/devtools-toast-preview";
-
-const ANARLOG_ICON_SRC = "/assets/anarlog-icon.png";
-const DESKTOP_UPDATE_TOAST_PREFIX = "desktop-update:";
 
 type ToastRegistryEntry = {
   toast: ToastType;
@@ -16,52 +12,37 @@ type ToastRegistryEntry = {
 };
 
 type ToastRegistryParams = {
-  isAuthenticated: boolean;
-  isAuthLoading: boolean;
   hasLLMConfigured: boolean;
   hasSttConfigured: boolean;
-  hasProSttConfigured: boolean;
-  hasProLlmConfigured: boolean;
   isAiTranscriptionTabActive: boolean;
   isAiIntelligenceTabActive: boolean;
   isBatchTranscribingInActiveTranscriptTab: boolean;
-  isLiveMeetingActive: boolean;
   hasActiveDownload: boolean;
   downloadingModel: string | null;
   activeDownloads: DownloadProgress[];
   localSttStatus: ServerStatus | null;
   isLocalSttModel: boolean;
-  update: DesktopUpdateControl;
-  onSignIn: () => void | Promise<void>;
   onOpenLLMSettings: () => void;
   onOpenSTTSettings: () => void;
 };
 
 type DevtoolsToastPreviewParams = {
   preview: DevtoolsToastPreview;
-  onSignIn: () => void | Promise<void>;
   onOpenLLMSettings: () => void;
   onOpenSTTSettings: () => void;
 };
 
 export function createToastRegistry({
-  isAuthenticated,
-  isAuthLoading,
   hasLLMConfigured,
   hasSttConfigured,
-  hasProSttConfigured,
-  hasProLlmConfigured,
   isAiTranscriptionTabActive,
   isAiIntelligenceTabActive,
   isBatchTranscribingInActiveTranscriptTab,
-  isLiveMeetingActive,
   hasActiveDownload,
   downloadingModel,
   activeDownloads,
   localSttStatus,
   isLocalSttModel,
-  update,
-  onSignIn,
   onOpenLLMSettings,
   onOpenSTTSettings,
 }: ToastRegistryParams): ToastRegistryEntry[] {
@@ -69,14 +50,6 @@ export function createToastRegistry({
     activeDownloads.length === 1 && downloadingModel
       ? t`Downloading ${downloadingModel}`
       : t`Downloading ${activeDownloads.length} models`;
-  const hasUsableSttConfigured =
-    hasSttConfigured &&
-    (isAuthLoading || isAuthenticated || !hasProSttConfigured);
-  const hasUsableLlmConfigured =
-    hasLLMConfigured &&
-    (isAuthLoading || isAuthenticated || !hasProLlmConfigured);
-  const updateToast = createDesktopUpdateToast(update);
-
   // order matters
   return [
     {
@@ -98,15 +71,7 @@ export function createToastRegistry({
       },
       condition: () => hasActiveDownload,
     },
-    ...(updateToast
-      ? [
-          {
-            toast: updateToast,
-            // Never show update prompts mid-meeting; they resurface after.
-            condition: () => !isLiveMeetingActive,
-          },
-        ]
-      : []),
+
     {
       toast: {
         id: "local-stt-loading",
@@ -137,29 +102,7 @@ export function createToastRegistry({
         !hasActiveDownload &&
         !isAiTranscriptionTabActive,
     },
-    {
-      toast: {
-        id: "sign-in-benefits",
-        icon: (
-          <img
-            src={ANARLOG_ICON_SRC}
-            alt="Anarlog"
-            className="size-5 object-contain object-center"
-          />
-        ),
-        description: t`Sign in to get the most out of Anarlog`,
-        primaryAction: {
-          label: t`Sign in`,
-          onClick: onSignIn,
-        },
-        lifecycle: {
-          type: "persistent",
-          dismissal: "permanent",
-          dismissalId: "auth-promotion",
-        },
-      },
-      condition: () => !isAuthLoading && !isAuthenticated,
-    },
+
     {
       toast: {
         id: "missing-stt",
@@ -170,7 +113,7 @@ export function createToastRegistry({
         },
         lifecycle: { type: "condition-bound" },
       },
-      condition: () => !hasUsableSttConfigured && !isAiTranscriptionTabActive,
+      condition: () => !hasSttConfigured && !isAiTranscriptionTabActive,
     },
     {
       toast: {
@@ -183,95 +126,9 @@ export function createToastRegistry({
         lifecycle: { type: "condition-bound" },
       },
       condition: () =>
-        hasUsableSttConfigured &&
-        !hasUsableLlmConfigured &&
-        !isAiIntelligenceTabActive,
-    },
-    {
-      toast: {
-        id: "upgrade-to-pro",
-        description: t`Pro features available`,
-        primaryAction: {
-          label: t`Upgrade`,
-          onClick: onSignIn,
-        },
-        lifecycle: {
-          type: "persistent",
-          dismissal: "permanent",
-          dismissalId: "auth-promotion",
-        },
-      },
-      // suppress until auth resolves to avoid flash on startup
-      condition: () =>
-        !isAuthLoading &&
-        !isAuthenticated &&
-        hasLLMConfigured &&
-        hasSttConfigured &&
-        !hasProSttConfigured &&
-        !hasProLlmConfigured,
+        hasSttConfigured && !hasLLMConfigured && !isAiIntelligenceTabActive,
     },
   ];
-}
-
-function createDesktopUpdateToast(
-  update: DesktopUpdateControl,
-): ToastType | null {
-  if (!update.status || !update.version) {
-    return null;
-  }
-
-  const id = `${DESKTOP_UPDATE_TOAST_PREFIX}${update.version}`;
-  const busy =
-    update.status === "downloading" ||
-    update.downloadStarting ||
-    update.installing;
-
-  if (update.status === "ready") {
-    return {
-      // A new ID separates the finished notification from the loading state while
-      // this update was downloading.
-      id: `${id}:ready`,
-      description: t`Anarlog ${update.version} is ready to install`,
-      primaryAction: update.installing
-        ? undefined
-        : { label: t`Restart`, onClick: update.installUpdate },
-      lifecycle: { type: "persistent", dismissal: "session" },
-    };
-  }
-
-  if (update.status === "downloading" || update.downloadStarting) {
-    const progress =
-      update.progress === null
-        ? ""
-        : ` (${Math.round(update.progress * 100)}%)`;
-    return {
-      id: `${id}:downloading`,
-      description: t`Downloading Anarlog ${update.version}${progress}`,
-      lifecycle: { type: "persistent", dismissal: "session" },
-      loading: true,
-    };
-  }
-
-  if (update.status === "failed") {
-    return {
-      id: `${id}:failed`,
-      description: update.errorMessage || t`The update download failed`,
-      primaryAction: busy
-        ? undefined
-        : { label: t`Retry`, onClick: update.downloadUpdate },
-      lifecycle: { type: "persistent", dismissal: "session" },
-      variant: "error",
-    };
-  }
-
-  return {
-    id: `${id}:available`,
-    description: t`Anarlog ${update.version} is available`,
-    primaryAction: busy
-      ? undefined
-      : { label: t`Download`, onClick: update.downloadUpdate },
-    lifecycle: { type: "persistent", dismissal: "day" },
-  };
 }
 
 export function getToastToShow(
@@ -292,10 +149,9 @@ export function getToastToShow(
 
 export function createDevtoolsToastPreview({
   preview,
-  onSignIn,
   onOpenLLMSettings,
   onOpenSTTSettings,
-}: DevtoolsToastPreviewParams): ToastType {
+}: DevtoolsToastPreviewParams): ToastType | null {
   switch (preview) {
     case "language-model":
       return {
@@ -336,14 +192,6 @@ export function createDevtoolsToastPreview({
         loading: true,
       };
     case "pro":
-      return {
-        id: "devtools-upgrade-to-pro",
-        description: t`Pro features available`,
-        primaryAction: {
-          label: t`Upgrade`,
-          onClick: onSignIn,
-        },
-        lifecycle: { type: "persistent", dismissal: "session" },
-      };
+      return null;
   }
 }

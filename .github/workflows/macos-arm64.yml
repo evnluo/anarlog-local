@@ -153,6 +153,9 @@ jobs:
           apps/desktop/src/sidebar/index.test.tsx
           apps/desktop/src/sidebar/index.tsx
           apps/desktop/src/sidebar/settings-nav-groups.ts
+          apps/desktop/src/sidebar/toast/index.test.tsx
+          apps/desktop/src/sidebar/toast/index.tsx
+          apps/desktop/src/sidebar/toast/registry.tsx
           apps/desktop/src/stt/meeting-disclosure.ts
           apps/desktop/src/templates/auto-form.tsx
 
@@ -175,6 +178,7 @@ jobs:
           src/settings/dictionary/index.test.tsx
           src/services/event-listeners.test.tsx
           src/sidebar/index.test.tsx
+          src/sidebar/toast/index.test.tsx
           src/automations/engine.test.ts
 
       - name: Test independent storage boundaries

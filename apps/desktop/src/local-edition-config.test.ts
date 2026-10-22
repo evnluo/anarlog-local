@@ -38,6 +38,12 @@ describe("Anarlog Local distribution identity", () => {
     expect(source("src/services/event-listeners.tsx")).not.toContain(
       "@anlg/plugin-updater2",
     );
+    expect(source("src/sidebar/toast/index.tsx")).not.toContain(
+      "~/main/update-banner",
+    );
+    expect(source("src/sidebar/toast/registry.tsx")).not.toContain(
+      "Upgrade to Pro",
+    );
   });
 
   it("has no vendor static-asset default", () => {
