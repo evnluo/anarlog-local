@@ -3,6 +3,7 @@
   "productName": "Anarlog Local",
   "mainBinaryName": "anarlog-local",
   "identifier": "com.evnluo.anarlog-local",
+  "version": "0.1.0",
   "build": {
     "features": ["direct-distribution"],
     "beforeDevCommand": "pnpm -F desktop dev",

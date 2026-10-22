@@ -11,6 +11,7 @@ describe("Anarlog Local distribution identity", () => {
     productName: string;
     mainBinaryName: string;
     identifier: string;
+    version: string;
     bundle: { publisher: string; createUpdaterArtifacts: boolean };
     plugins?: { updater?: { active?: boolean } };
   };
@@ -19,6 +20,7 @@ describe("Anarlog Local distribution identity", () => {
     expect(config.productName).toBe("Anarlog Local");
     expect(config.mainBinaryName).toBe("anarlog-local");
     expect(config.identifier).toBe("com.evnluo.anarlog-local");
+    expect(config.version).toBe("0.1.0");
     expect(config.bundle.publisher).not.toBe("Fastrepl");
   });
 
@@ -30,6 +32,9 @@ describe("Anarlog Local distribution identity", () => {
     expect(nativeSource).toContain("plugin(tauri_plugin_tray::init(false))");
     expect(nativeSource).toContain("plugin(tauri_plugin_db::init(db.clone()))");
     expect(nativeSource).not.toContain("init_with_cloudsync");
+    expect(source("src/settings/queries.ts")).not.toContain(
+      "@anlg/plugin-updater2",
+    );
   });
 
   it("has no vendor static-asset default", () => {

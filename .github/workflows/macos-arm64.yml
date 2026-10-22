@@ -139,6 +139,11 @@ jobs:
           apps/desktop/src/settings/dictation.tsx
           apps/desktop/src/settings/general/app-settings.test.tsx
           apps/desktop/src/settings/general/app-settings.tsx
+          apps/desktop/src/settings/general/index.tsx
+          apps/desktop/src/settings/privacy/index.test.tsx
+          apps/desktop/src/settings/privacy/index.tsx
+          apps/desktop/src/settings/queries.test.tsx
+          apps/desktop/src/settings/queries.ts
           apps/desktop/src/shared/main-app-layout.test.tsx
           apps/desktop/src/shared/main-app-layout.tsx
           apps/desktop/src/shared/ui/resource-list/hooks.ts
@@ -163,6 +168,8 @@ jobs:
           src/dictation/lifecycle.test.tsx
           src/onboarding/welcome-note.test.ts
           src/settings/general/app-settings.test.tsx
+          src/settings/privacy/index.test.tsx
+          src/settings/queries.test.tsx
           src/settings/dictionary/index.test.tsx
           src/sidebar/index.test.tsx
           src/automations/engine.test.ts

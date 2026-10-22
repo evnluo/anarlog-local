@@ -7,7 +7,6 @@ const mocks = vi.hoisted(() => ({
   setDisabled: vi.fn(async () => ({ status: "ok", data: null })),
   setErrorReportingEnabled: vi.fn(async () => undefined),
   setSessionReplayAnalyticsEnabled: vi.fn(),
-  setAutomaticUpdatesEnabled: vi.fn(async () => undefined),
   setProperties: vi.fn(async () => undefined),
   executeTransaction: vi.fn(
     (_statements: Array<{ sql: string; params: unknown[] }>) =>
@@ -36,12 +35,6 @@ vi.mock("@anlg/plugin-detect", () => ({
 vi.mock("@anlg/plugin-template", () => ({
   commands: {
     getTemplateSource: mocks.getTemplateSource,
-  },
-}));
-
-vi.mock("@anlg/plugin-updater2", () => ({
-  commands: {
-    setAutomaticUpdatesEnabled: mocks.setAutomaticUpdatesEnabled,
   },
 }));
 
@@ -318,12 +311,6 @@ describe("SQLite settings", () => {
     ]);
 
     expect(result.values.theme).toBe("dark");
-  });
-
-  it("applies the automatic update policy when it changes", async () => {
-    await setSettingValues({ automatic_updates: false });
-
-    expect(mocks.setAutomaticUpdatesEnabled).toHaveBeenCalledWith(false);
   });
 
   it("disables PostHog after persisting the analytics opt-out", async () => {

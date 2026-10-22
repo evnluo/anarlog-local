@@ -35,14 +35,6 @@ export function SettingsPrivacy() {
     return null;
   }
 
-  const posthogEnabled = resolveConfigValue(
-    "telemetry_consent",
-    settingsQuery.data,
-  );
-  const sentryEnabled = resolveConfigValue(
-    "crash_reporting_consent",
-    settingsQuery.data,
-  );
   const lockAppEnabled = resolveConfigValue("lock_app", settingsQuery.data);
   const authAvailable = available === true;
   const lockAppDescription = !authAvailable
@@ -72,24 +64,6 @@ export function SettingsPrivacy() {
               setSettingValues({ lock_app: next });
               if (next) lockApp();
             })();
-          }}
-        />
-        <SettingSwitchRow
-          title={i18n._(privacyMessages.posthogTitle)}
-          description={i18n._(privacyMessages.posthogDescription)}
-          checked={posthogEnabled}
-          onChange={(telemetryConsent) => {
-            setSettingValues({ telemetry_consent: telemetryConsent });
-          }}
-        />
-        <SettingSwitchRow
-          title={t`Error`}
-          description={t`Send sanitized crash and error reports to help improve Anarlog.`}
-          checked={sentryEnabled}
-          onChange={(crashReportingConsent) => {
-            setSettingValues({
-              crash_reporting_consent: crashReportingConsent,
-            });
           }}
         />
       </section>

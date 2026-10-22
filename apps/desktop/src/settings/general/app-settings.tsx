@@ -6,8 +6,6 @@ import { SettingSwitchRow } from "~/settings/setting-row";
 
 export const privacyMessages = {
   title: msg`Privacy`,
-  posthogTitle: msg`Share usage data`,
-  posthogDescription: msg`Help improve Anarlog with anonymous usage data.`,
 };
 
 interface SettingItem {
@@ -19,7 +17,6 @@ interface SettingItem {
 interface AppSettingsViewProps {
   appStoreBuild: boolean;
   autostart: SettingItem;
-  automaticUpdates: SettingItem;
   showAppInDock: SettingItem;
   showTrayIcon: SettingItem;
 }
@@ -27,7 +24,6 @@ interface AppSettingsViewProps {
 export function AppSettingsView({
   appStoreBuild,
   autostart,
-  automaticUpdates,
   showAppInDock,
   showTrayIcon,
 }: AppSettingsViewProps) {
@@ -47,17 +43,6 @@ export function AppSettingsView({
                 }
                 checked={autostart.value}
                 onChange={autostart.onChange}
-              />
-              <SettingSwitchRow
-                title={<Trans>Automatically install updates</Trans>}
-                description={
-                  <Trans>
-                    Stay current with updates installed the next time Anarlog
-                    Local opens.
-                  </Trans>
-                }
-                checked={automaticUpdates.value}
-                onChange={automaticUpdates.onChange}
               />
             </>
           )}
