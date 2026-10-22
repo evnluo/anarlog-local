@@ -33,7 +33,7 @@ import { cn } from "@anlg/utils";
 import { useFolderSelection } from "./selection";
 
 import { useOptionalAuth } from "~/auth";
-import { ResourceShareButton, sharedFolderPayload } from "~/resource-sharing";
+import { sharedFolderPayload } from "~/resource-sharing";
 import {
   deleteSharedResource,
   moveSharedResource,
@@ -268,12 +268,6 @@ export function FolderEditor({ folderPath }: { folderPath: string }) {
           </div>
         </div>
         <div className="flex items-center gap-0.5">
-          <ResourceShareButton
-            resourceType="folder"
-            sourceId={folderPath}
-            title={displayName}
-            buildPayload={() => sharedFolderPayload(folderPath)}
-          />
           <DropdownMenu open={actionsOpen} onOpenChange={setActionsOpen}>
             <DropdownMenuTrigger asChild>
               <Button

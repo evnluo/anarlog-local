@@ -113,6 +113,7 @@ jobs:
           apps/desktop/src/dictation/lifecycle.test.tsx
           apps/desktop/src/dictation/lifecycle.tsx
           apps/desktop/src/env.ts
+          apps/desktop/src/folders/folder-editor.tsx
           apps/desktop/src/local-edition-config.test.ts
           apps/desktop/src/local-edition.test.ts
           apps/desktop/src/local-edition.ts
@@ -158,6 +159,7 @@ jobs:
           apps/desktop/src/sidebar/toast/registry.tsx
           apps/desktop/src/stt/meeting-disclosure.ts
           apps/desktop/src/templates/auto-form.tsx
+          apps/desktop/src/templates/template-form.tsx
 
       - name: Type-check desktop
         run: pnpm --filter @anlg/desktop typecheck

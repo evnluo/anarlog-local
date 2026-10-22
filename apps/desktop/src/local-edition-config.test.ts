@@ -44,6 +44,12 @@ describe("Anarlog Local distribution identity", () => {
     expect(source("src/sidebar/toast/registry.tsx")).not.toContain(
       "Upgrade to Pro",
     );
+    expect(source("src/folders/folder-editor.tsx")).not.toContain(
+      "ResourceShareButton",
+    );
+    expect(source("src/templates/template-form.tsx")).not.toContain(
+      "ResourceShareButton",
+    );
   });
 
   it("has no vendor static-asset default", () => {
