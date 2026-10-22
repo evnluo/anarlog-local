@@ -1,0 +1,178 @@
+import { describe, expect, it } from "vitest";
+
+import { summarizeActivity } from "./activity";
+import type { ActivityRecord } from "./queries";
+
+const now = new Date("2026-09-05T12:00:00Z");
+const record = (
+  session: string,
+  date: string,
+  duration = 3_600_000,
+): ActivityRecord => ({
+  session_id: session,
+  started_at_ms: Date.parse(date),
+  created_at: date,
+  duration_ms: duration,
+});
+
+describe("personal activity", () => {
+  it("counts each conversation on its earliest capture weekday, regardless of transcript order", () => {
+    const stats = summarizeActivity(
+      [
+        record("resumed", "2026-09-03T09:00:00Z", 30 * 60_000),
+        record("resumed", "2026-09-02T09:00:00Z", 30 * 60_000),
+        record("resumed", "2026-09-02T09:15:00Z", 30 * 60_000),
+        record("second", "2026-09-02T14:00:00Z", 15 * 60_000),
+        record("untimed", "2026-09-04T14:00:00Z", 0),
+      ],
+      now,
+      "UTC",
+      1,
+    );
+    expect(stats.weekdayCounts.map((day) => day.weekday)).toEqual([
+      1, 2, 3, 4, 5, 6, 0,
+    ]);
+    expect(stats.weekdayCounts.map((day) => day.count)).toEqual([
+      0, 0, 2, 0, 1, 0, 0,
+    ]);
+    expect(stats).toMatchObject({
+      conversations: 3,
+      conversationDays: 2,
+      timedConversations: 2,
+      medianMinutes: 45,
+    });
+  });
+
+  it("uses the selected period and timezone for weekdays and typical length", () => {
+    const stats = summarizeActivity(
+      [
+        record("resumed", "2026-08-01T09:00:00Z", 3_600_000),
+        record("resumed", "2026-08-29T15:00:00Z", 600_000),
+        record("old", "2026-08-29T14:59:00Z"),
+        record("seoul-wednesday", "2026-09-01T16:00:00Z", 1_200_000),
+        record("third", "2026-09-04T16:00:00Z", 1_800_000),
+      ],
+      now,
+      "Asia/Seoul",
+      0,
+      "7d",
+    );
+    expect(stats.weekdayCounts.map((day) => day.count)).toEqual([
+      1, 0, 0, 1, 0, 0, 1,
+    ]);
+    expect(stats.medianMinutes).toBe(20);
+    expect(stats.conversations).toBe(3);
+  });
+
+  it("does not turn missing or unfinished timing into a zero-minute median", () => {
+    const stats = summarizeActivity(
+      [
+        record("missing", "2026-09-02T09:00:00Z", NaN),
+        record("negative", "2026-09-03T09:00:00Z", -1),
+        record("just-started", now.toISOString()),
+        record("future", "2026-10-01T09:00:00Z"),
+      ],
+      now,
+      "UTC",
+    );
+    expect(stats.medianMinutes).toBeNull();
+    expect(stats.timedConversations).toBe(0);
+    expect(stats.weekdayCounts.reduce((sum, day) => sum + day.count, 0)).toBe(
+      3,
+    );
+  });
+
+  it("starts empty with a complete calendar", () => {
+    const stats = summarizeActivity([], now, "UTC");
+    expect(stats).toMatchObject({
+      conversations: 0,
+      activeDays: 0,
+      hours: 0,
+      streak: 0,
+    });
+    expect(stats.days[0].date.getDay()).toBe(0);
+    expect(stats.days[stats.days.length - 1]?.key).toBe("2026-09-05");
+    expect(stats.days.length).toBeGreaterThanOrEqual(365);
+  });
+
+  it("deduplicates sessions and overlapping transcript timing while retaining resumed recording", () => {
+    const stats = summarizeActivity(
+      [
+        record("a", "2026-09-04T09:00:00Z"),
+        record("a", "2026-09-04T09:30:00Z"),
+        record("a", "2026-09-04T12:00:00Z"),
+        record("b", "2026-09-04T14:00:00Z"),
+      ],
+      now,
+      "UTC",
+    );
+    expect(stats).toMatchObject({
+      conversations: 2,
+      activeDays: 1,
+      hours: 3.5,
+    });
+    expect(stats.days.find((day) => day.key === "2026-09-04")?.count).toBe(2);
+  });
+
+  it("filters calendar days in the selected timezone while keeping all-time milestones", () => {
+    const stats = summarizeActivity(
+      [
+        record("old", "2026-08-29T14:59:00Z"),
+        record("edge", "2026-08-29T15:00:00Z"),
+        record("today", "2026-09-04T23:00:00Z"),
+      ],
+      now,
+      "Asia/Seoul",
+      1,
+      "7d",
+    );
+    expect(stats).toMatchObject({
+      conversations: 2,
+      activeDays: 2,
+      totalConversations: 3,
+    });
+    expect(stats.days.find((day) => day.key === "2026-09-05")?.count).toBe(1);
+  });
+
+  it("keeps a weekly streak during an unfinished week and resets it after a missed week", () => {
+    const records = [
+      record("a", "2026-08-19T12:00:00Z"),
+      record("b", "2026-08-26T12:00:00Z"),
+    ];
+    expect(summarizeActivity(records, now, "UTC", 1).streak).toBe(2);
+    expect(
+      summarizeActivity(records, new Date("2026-09-07T12:00:00Z"), "UTC", 1)
+        .streak,
+    ).toBe(0);
+  });
+
+  it("handles DST without dropping or duplicating heatmap days", () => {
+    const stats = summarizeActivity(
+      [
+        record("a", "2026-03-08T06:30:00Z"),
+        record("b", "2026-03-08T07:30:00Z"),
+      ],
+      now,
+      "America/New_York",
+    );
+    expect(stats.activeDays).toBe(1);
+    expect(new Set(stats.days.map((day) => day.key)).size).toBe(
+      stats.days.length,
+    );
+    expect(stats.days.find((day) => day.key === "2026-03-08")?.count).toBe(2);
+  });
+
+  it("ignores invalid and future dates, falls back to creation time, and caps unfinished timing", () => {
+    const stats = summarizeActivity(
+      [
+        record("future", "2027-01-01T00:00:00Z"),
+        record("invalid", "invalid"),
+        { ...record("legacy", "2026-09-04T00:00:00Z"), started_at_ms: 0 },
+        record("current", "2026-09-05T11:30:00Z"),
+      ],
+      now,
+      "UTC",
+    );
+    expect(stats).toMatchObject({ conversations: 2, hours: 1.5 });
+  });
+});

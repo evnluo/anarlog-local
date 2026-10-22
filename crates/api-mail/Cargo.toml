@@ -1,0 +1,16 @@
+[package]
+name = "api-mail"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anlg-api-auth = { workspace = true }
+anlg-api-error = { workspace = true }
+anlg-api-nango = { workspace = true }
+anlg-google-mail = { workspace = true, features = ["utoipa"] }
+
+axum = { workspace = true }
+utoipa = { workspace = true }
+
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }

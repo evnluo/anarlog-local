@@ -1,0 +1,1188 @@
+import { Trans, useLingui } from "@lingui/react/macro";
+import { useForm } from "@tanstack/react-form";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+
+import {
+  getCloudsyncStatus,
+  getE2eeIdentityStatus,
+  getOrCreateE2eeDeviceIdentity,
+  syncCloudsyncNow,
+} from "@anlg/plugin-db";
+import { commands as openerCommands } from "@anlg/plugin-opener2";
+import {
+  ArrowsClockwise,
+  CheckCircle,
+  CircleNotch,
+  CloudSlash,
+  PencilSimple,
+  Plugs,
+  Plus,
+  Warning,
+} from "@anlg/ui/components/icons";
+import { Badge } from "@anlg/ui/components/ui/badge";
+import { Button } from "@anlg/ui/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@anlg/ui/components/ui/dialog";
+import { Input } from "@anlg/ui/components/ui/input";
+import { Switch } from "@anlg/ui/components/ui/switch";
+import { toast } from "@anlg/ui/components/ui/toast";
+import { cn, formatDistanceToNow } from "@anlg/utils";
+
+import { E2eeSetupDialog } from "../general/e2ee-setup";
+import { SyncHealthSection } from "./health";
+import { SyncLog } from "./log";
+
+import { trackAnalyticsEvent } from "~/analytics";
+import { useAuth } from "~/auth";
+import { useBillingAccess } from "~/auth/billing-context";
+import {
+  applyCloudsyncPreference,
+  getCloudsyncCredentialBlock,
+  refreshCloudsyncForSession,
+  subscribeCloudsyncCredentialBlock,
+} from "~/auth/cloudsync";
+import {
+  getDeviceIdentity,
+  setCredentialBlock,
+} from "~/auth/cloudsync-credentials";
+import { ConnectLocalLibraryDialog } from "~/auth/connect-local-library-dialog";
+import {
+  registerDeviceEnrollment,
+  removeSyncDevice,
+  renameSyncDevice,
+  requestSyncDevices,
+} from "~/auth/sync-devices";
+import { captureOperationalError } from "~/error-reporting";
+import { SettingsPageTitle } from "~/settings/page-title";
+import { PlanGate } from "~/settings/plan-gate";
+import {
+  setSettingValue,
+  useStoredSettingValuesQuery,
+} from "~/settings/queries";
+import { resolveConfigValue } from "~/shared/config";
+import { isKeychainAccessError, repairKeychainAccess } from "~/shared/keychain";
+import { buildWebAppUrl } from "~/shared/utils";
+import { useTabs } from "~/store/zustand/tabs";
+
+const STATUS_POLL_INTERVAL_MS = 10_000;
+
+async function readE2eeIdentityStatus(accountUserId: string) {
+  try {
+    return await getE2eeIdentityStatus(accountUserId);
+  } catch (error) {
+    throw error instanceof Error ? error : new Error(String(error));
+  }
+}
+
+function DeviceTitle({
+  name,
+  current,
+  onRename,
+}: {
+  name: string | null;
+  current: boolean;
+  onRename?: () => void;
+}) {
+  const { t } = useLingui();
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <p className="truncate text-sm font-medium">
+        {name || t`Unnamed device`}
+      </p>
+      {current ? (
+        <Badge variant="secondary" size="sm" className="shrink-0">
+          <Trans>This device</Trans>
+        </Badge>
+      ) : null}
+      {current && onRename ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="text-muted-foreground hover:text-foreground size-6 shrink-0"
+          aria-label={t`Rename device`}
+          onClick={onRename}
+        >
+          <PencilSimple className="size-3.5" />
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+function isValidDeviceName(name: string) {
+  const trimmed = name.trim();
+  return trimmed.length > 0 && new TextEncoder().encode(trimmed).length <= 128;
+}
+
+function RenameDeviceDialog({
+  name,
+  pending,
+  error,
+  onOpenChange,
+  onRename,
+}: {
+  name: string | null;
+  pending: boolean;
+  error: Error | null;
+  onOpenChange: (open: boolean) => void;
+  onRename: (name: string) => void;
+}) {
+  const { t } = useLingui();
+  const form = useForm({
+    defaultValues: { name: name ?? "" },
+    onSubmit: ({ value }) => {
+      if (isValidDeviceName(value.name)) {
+        onRename(value.name.trim());
+      }
+    },
+  });
+
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-sm">
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            void form.handleSubmit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>
+              <Trans>Rename this device</Trans>
+            </DialogTitle>
+            <DialogDescription>
+              <Trans>
+                This name is synced to your other devices signed in to this
+                account.
+              </Trans>
+            </DialogDescription>
+          </DialogHeader>
+          <form.Field name="name">
+            {(field) => (
+              <Input
+                autoFocus
+                aria-label={t`Device name`}
+                className="mt-4"
+                maxLength={128}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+            )}
+          </form.Field>
+          {error ? (
+            <p className="mt-2 text-xs text-red-500">{error.message}</p>
+          ) : null}
+          <DialogFooter className="mt-5">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={pending}
+              onClick={() => onOpenChange(false)}
+            >
+              <Trans>Cancel</Trans>
+            </Button>
+            <form.Subscribe selector={(state) => state.values.name}>
+              {(value) => (
+                <Button
+                  type="submit"
+                  disabled={pending || !isValidDeviceName(value)}
+                >
+                  {pending ? (
+                    <CircleNotch className="size-4 animate-spin" />
+                  ) : null}
+                  <Trans>Save</Trans>
+                </Button>
+              )}
+            </form.Subscribe>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function DisconnectDeviceButton({
+  fingerprint,
+  isPending,
+  pendingFingerprint,
+  onDisconnect,
+}: {
+  fingerprint: string;
+  isPending: boolean;
+  pendingFingerprint?: string;
+  onDisconnect: (fingerprint: string) => void;
+}) {
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="text-foreground hover:!border-destructive hover:!bg-destructive/10 hover:!text-destructive"
+      disabled={isPending}
+      onClick={() => onDisconnect(fingerprint)}
+    >
+      {isPending && pendingFingerprint === fingerprint ? (
+        <CircleNotch className="size-3.5 animate-spin" />
+      ) : (
+        <Plugs className="size-3.5" />
+      )}
+      <Trans>Disconnect</Trans>
+    </Button>
+  );
+}
+
+function SyncSettingsPreview() {
+  const { t } = useLingui();
+
+  return (
+    <section className="flex flex-col gap-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 gap-3">
+          <div className="flex size-9 shrink-0 items-center justify-center rounded-full">
+            <CloudSlash className="text-muted-foreground size-4" />
+          </div>
+          <div className="min-w-0">
+            <h3 className="text-sm font-medium">
+              <Trans>Sync paused</Trans>
+            </h3>
+            <p className="text-muted-foreground mt-1 text-xs leading-5">
+              <Trans>Changes stay on this device until you resume sync.</Trans>
+            </p>
+          </div>
+        </div>
+        <Switch aria-label={t`Cloud sync`} checked={false} />
+      </div>
+      <div className="flex items-center justify-between gap-4">
+        <p className="text-muted-foreground text-xs">
+          <Trans>Keep notes current automatically.</Trans>
+        </p>
+        <Button variant="outline" size="sm">
+          <ArrowsClockwise className="size-3.5" />
+          <Trans>Sync now</Trans>
+        </Button>
+      </div>
+      <div>
+        <h2 className="mb-4 font-sans text-lg font-semibold">
+          <Trans>Devices</Trans>
+        </h2>
+        <div className="border-border/60 overflow-hidden rounded-xl border">
+          <p className="text-muted-foreground px-4 py-5 text-center text-xs">
+            <Trans>No devices registered yet.</Trans>
+          </p>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export function SettingsSync() {
+  const [connectLibraryOpen, setConnectLibraryOpen] = useState(false);
+  const { t } = useLingui();
+  const auth = useAuth();
+  const { isPro, isReady } = useBillingAccess();
+  const openNew = useTabs((state) => state.openNew);
+  const queryClient = useQueryClient();
+  const [e2eeSetupOpen, setE2eeSetupOpen] = useState(false);
+  const [addDeviceOpen, setAddDeviceOpen] = useState(false);
+  const [renamingDevice, setRenamingDevice] = useState<{
+    fingerprint: string;
+    name: string | null;
+  } | null>(null);
+  const lastTrackedSyncAtRef = useRef<number | null>(null);
+  const lastTrackedFailureCountRef = useRef<number | null>(null);
+  const manualSyncBaselineRef = useRef<number | null>(null);
+  const manualFailureBaselineRef = useRef<number | null>(null);
+  const manualSyncInFlightRef = useRef(false);
+  const manualSyncResultAtRef = useRef<number | null>(null);
+  const manualFailureResultRef = useRef<number | null>(null);
+  const settingsQuery = useStoredSettingValuesQuery();
+  const session = auth.session;
+  const credentialBlock = useSyncExternalStore(
+    subscribeCloudsyncCredentialBlock,
+    getCloudsyncCredentialBlock,
+    getCloudsyncCredentialBlock,
+  );
+  const storedSyncEnabled = settingsQuery.data
+    ? resolveConfigValue("cloud_sync_enabled", settingsQuery.data)
+    : true;
+  const statusQueryKey = [
+    "cloudsync-status-settings",
+    session?.user.id,
+  ] as const;
+
+  const e2eeIdentityQuery = useQuery({
+    queryKey: ["e2ee-identity", session?.user.id],
+    queryFn: () => readE2eeIdentityStatus(session!.user.id),
+    enabled: Boolean(session?.user.id),
+    refetchInterval:
+      credentialBlock === "approval_pending" ? STATUS_POLL_INTERVAL_MS : false,
+    retry: false,
+  });
+  // eslint-disable-next-line @tanstack/query/exhaustive-deps -- Cache by account; rotating access tokens must not become cache keys.
+  const devicesQuery = useQuery({
+    queryKey: ["sync-devices", session?.user.id],
+    queryFn: ({ signal }) => requestSyncDevices(session!.access_token, signal),
+    enabled: Boolean(session && isPro),
+    refetchInterval: (query) =>
+      query.state.data?.pendingDevices.length ? 5_000 : false,
+  });
+  const usedDeviceSlots = new Set([
+    ...(devicesQuery.data?.devices ?? []).map(
+      (device) => device.deviceFingerprint,
+    ),
+    ...(devicesQuery.data?.pendingDevices ?? []).map(
+      (device) => device.deviceFingerprint,
+    ),
+  ]).size;
+  const deviceIdentityQuery = useQuery({
+    queryKey: ["device-identity"],
+    queryFn: getDeviceIdentity,
+  });
+  const removeDeviceMutation = useMutation({
+    mutationFn: (fingerprint: string) =>
+      removeSyncDevice(session!.access_token, fingerprint),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: ["sync-devices", session?.user.id],
+      });
+      if (credentialBlock === "device_limit") {
+        const result = await refreshCloudsyncForSession(session!);
+        if (result === "account_mismatch") {
+          setConnectLibraryOpen(true);
+        }
+      }
+    },
+  });
+  const openMoreDevicesMutation = useMutation({
+    mutationFn: async () => {
+      const url = new URL(
+        await buildWebAppUrl("/app/account", { tab: "connections" }),
+      );
+      url.hash = "devices";
+      const opened = await openerCommands.openUrl(url.toString(), null);
+      if (opened.status === "error") {
+        throw new Error(String(opened.error));
+      }
+    },
+    onError: (error) => {
+      captureOperationalError(error, {
+        operation: "open_sync_device_addons",
+      });
+      toast.error(t`Couldn't open device add-ons. Try again.`);
+    },
+  });
+  const renameDeviceMutation = useMutation({
+    mutationFn: ({
+      fingerprint,
+      name,
+    }: {
+      fingerprint: string;
+      name: string;
+    }) => renameSyncDevice(session!.access_token, fingerprint, name),
+    onSuccess: async () => {
+      setRenamingDevice(null);
+      await queryClient.invalidateQueries({
+        queryKey: ["sync-devices", session?.user.id],
+      });
+    },
+  });
+  const replaceDeviceMutation = useMutation({
+    mutationFn: async (replaceFingerprint: string) => {
+      const [device, enrollmentIdentity] = await Promise.all([
+        getDeviceIdentity(),
+        getOrCreateE2eeDeviceIdentity(session!.user.id),
+      ]);
+      if (!device.fingerprint) {
+        throw new Error(t`Could not identify this device. Try again.`);
+      }
+      await registerDeviceEnrollment({
+        accessToken: session!.access_token,
+        publicKey: enrollmentIdentity.publicKey,
+        fingerprint: device.fingerprint,
+        deviceName: device.name,
+        replaceFingerprint,
+      });
+      const result = await refreshCloudsyncForSession(session!);
+      if (result === "account_mismatch") {
+        setConnectLibraryOpen(true);
+      }
+    },
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: ["sync-devices", session?.user.id],
+      }),
+  });
+  const setSyncEnabledMutation = useMutation({
+    mutationKey: ["cloudsync-preference"],
+    mutationFn: async (enabled: boolean) => {
+      await setSettingValue("cloud_sync_enabled", enabled);
+      const result = await applyCloudsyncPreference(session);
+      if (result === "account_mismatch") {
+        setConnectLibraryOpen(true);
+      }
+      return result;
+    },
+    onSuccess: (result, enabled) => {
+      if (result === "account_mismatch") {
+        trackAnalyticsEvent("cloud_sync_failed", {
+          trigger: enabled ? "enable" : "disable",
+          failure_stage: "preference",
+        });
+        return;
+      }
+      trackAnalyticsEvent(
+        enabled ? "cloud_sync_enabled" : "cloud_sync_disabled",
+        {
+          entry_point: "settings",
+        },
+      );
+    },
+    onError: (error, enabled) => {
+      captureOperationalError(error, {
+        operation: "cloud_sync_preference_update",
+        context: { enabled },
+      });
+      trackAnalyticsEvent("cloud_sync_failed", {
+        trigger: enabled ? "enable" : "disable",
+        failure_stage: "preference",
+      });
+    },
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: statusQueryKey });
+    },
+  });
+  const e2eePreflightMutation = useMutation({
+    mutationKey: ["e2ee-preflight"],
+    mutationFn: async () => {
+      if (!session?.user.id) {
+        throw new Error(t`Sign in before enabling encrypted cloud sync`);
+      }
+      return readE2eeIdentityStatus(session.user.id);
+    },
+    onSuccess: ({ configured }) => {
+      if (configured) {
+        setSyncEnabledMutation.mutate(true);
+      } else {
+        setSyncEnabledMutation.mutate(true, {
+          onSuccess: () => {
+            if (getCloudsyncCredentialBlock() === "setup_required") {
+              setE2eeSetupOpen(true);
+            }
+          },
+        });
+      }
+    },
+  });
+  const repairKeychainMutation = useMutation({
+    mutationKey: ["repair-keychain-access", "settings"],
+    mutationFn: async () => {
+      // A failed resume attempt should be retried once Keychain is reachable again.
+      const retryEnable =
+        e2eePreflightMutation.error !== null &&
+        isKeychainAccessError(e2eePreflightMutation.error);
+      await repairKeychainAccess();
+      setCredentialBlock(null);
+      setSyncEnabledMutation.reset();
+      e2eePreflightMutation.reset();
+      if (retryEnable) {
+        e2eePreflightMutation.mutate();
+        return;
+      }
+      const result = await applyCloudsyncPreference(session);
+      if (result === "account_mismatch") {
+        setConnectLibraryOpen(true);
+      }
+    },
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["e2ee-identity", session?.user.id],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["cloudsync-status-indicator"],
+        }),
+        queryClient.invalidateQueries({ queryKey: statusQueryKey }),
+      ]);
+    },
+  });
+  const syncPreferred = setSyncEnabledMutation.isPending
+    ? (setSyncEnabledMutation.variables ?? storedSyncEnabled)
+    : storedSyncEnabled;
+  const syncSwitchChecked =
+    syncPreferred && credentialBlock !== "setup_required";
+  const statusQuery = useQuery({
+    queryKey: statusQueryKey,
+    queryFn: getCloudsyncStatus,
+    refetchInterval: STATUS_POLL_INTERVAL_MS,
+    refetchIntervalInBackground: false,
+    enabled: Boolean(session) && isPro && syncPreferred,
+  });
+  const syncNowMutation = useMutation({
+    mutationFn: syncCloudsyncNow,
+    onMutate: () => {
+      manualSyncInFlightRef.current = true;
+      manualSyncBaselineRef.current = lastTrackedSyncAtRef.current;
+      manualFailureBaselineRef.current = lastTrackedFailureCountRef.current;
+    },
+    onSuccess: () => {
+      trackAnalyticsEvent("cloud_sync_completed", {
+        trigger: "manual",
+      });
+    },
+    onError: (error) => {
+      captureOperationalError(error, {
+        operation: "cloud_sync_manual",
+      });
+      trackAnalyticsEvent("cloud_sync_failed", {
+        trigger: "manual",
+        failure_stage: "sync",
+      });
+    },
+    onSettled: async (_data, error) => {
+      await queryClient.invalidateQueries({ queryKey: statusQueryKey });
+      const refreshedStatus =
+        queryClient.getQueryData<
+          Awaited<ReturnType<typeof getCloudsyncStatus>>
+        >(statusQueryKey);
+      if (error) {
+        manualFailureResultRef.current =
+          refreshedStatus?.consecutive_failures ?? null;
+      } else {
+        manualSyncResultAtRef.current =
+          refreshedStatus?.last_sync_at_ms ?? null;
+      }
+      manualSyncInFlightRef.current = false;
+      manualSyncBaselineRef.current = null;
+      manualFailureBaselineRef.current = null;
+    },
+  });
+  const status = statusQuery.data;
+
+  useEffect(() => {
+    if (!status) return;
+
+    if (
+      status.last_sync_at_ms !== null &&
+      status.last_sync_at_ms !== lastTrackedSyncAtRef.current
+    ) {
+      if (lastTrackedSyncAtRef.current !== null) {
+        if (
+          (manualSyncInFlightRef.current &&
+            manualSyncBaselineRef.current === lastTrackedSyncAtRef.current) ||
+          manualSyncResultAtRef.current === status.last_sync_at_ms
+        ) {
+          manualSyncBaselineRef.current = null;
+          manualSyncResultAtRef.current = null;
+        } else {
+          trackAnalyticsEvent("cloud_sync_completed", {
+            trigger: "background",
+          });
+        }
+      }
+      lastTrackedSyncAtRef.current = status.last_sync_at_ms;
+    }
+
+    if (
+      lastTrackedFailureCountRef.current !== null &&
+      status.consecutive_failures > lastTrackedFailureCountRef.current
+    ) {
+      if (
+        (manualSyncInFlightRef.current &&
+          manualFailureBaselineRef.current ===
+            lastTrackedFailureCountRef.current) ||
+        manualFailureResultRef.current === status.consecutive_failures
+      ) {
+        manualFailureBaselineRef.current = null;
+        manualFailureResultRef.current = null;
+      } else {
+        trackAnalyticsEvent("cloud_sync_failed", {
+          trigger: "background",
+          failure_kind: status.last_error_kind ?? "unknown",
+        });
+      }
+    }
+    lastTrackedFailureCountRef.current = status.consecutive_failures;
+  }, [status]);
+
+  if (settingsQuery.error) {
+    throw settingsQuery.error;
+  }
+  if (settingsQuery.isLoading || !settingsQuery.data || !isReady) {
+    return (
+      <div className="flex min-h-48 items-center justify-center">
+        <CircleNotch
+          aria-label={t`Loading sync settings`}
+          className="text-muted-foreground size-5 animate-spin"
+        />
+      </div>
+    );
+  }
+
+  const openAccountSettings = () => {
+    openNew({ type: "settings", state: { tab: "account" } });
+  };
+
+  if (!session) {
+    return (
+      <div className="flex flex-col gap-8">
+        <SettingsPageTitle title={<Trans>Sync</Trans>} />
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex gap-3">
+            <div className="bg-muted flex size-9 shrink-0 items-center justify-center rounded-full">
+              <CloudSlash className="text-muted-foreground size-4" />
+            </div>
+            <div>
+              <h3 className="text-sm font-medium">
+                <Trans>Sign in to use cloud sync</Trans>
+              </h3>
+              <p className="text-muted-foreground mt-1 text-xs leading-5">
+                <Trans>
+                  Keep notes encrypted and synced across your devices.
+                </Trans>
+              </p>
+            </div>
+          </div>
+          <Button variant="outline" size="sm" onClick={openAccountSettings}>
+            <Trans>Sign in</Trans>
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isPro) {
+    return (
+      <div className="flex flex-col gap-8">
+        <SettingsPageTitle title={<Trans>Sync</Trans>} />
+        <PlanGate plan="pro" allowed={false}>
+          <SyncSettingsPreview />
+        </PlanGate>
+      </div>
+    );
+  }
+
+  const statusView = (() => {
+    if (!syncPreferred) {
+      return {
+        kind: "paused" as const,
+        label: t`Sync paused`,
+        description: t`Changes stay on this device until you resume sync.`,
+      };
+    }
+    if (credentialBlock !== null) {
+      if (credentialBlock === "approval_pending") {
+        return {
+          kind: "local" as const,
+          label: t`Connecting this device`,
+          description: t`Open Anarlog on an existing synced device signed in to the same account. This device will connect automatically.`,
+        };
+      }
+      if (credentialBlock === "device_limit") {
+        return {
+          kind: "error" as const,
+          label: t`Device limit reached`,
+          description: t`Choose a device below to replace, or add more device slots to your plan. This device will continue automatically.`,
+        };
+      }
+      if (credentialBlock === "clock_skew") {
+        return {
+          kind: "error" as const,
+          label: t`Sync needs attention`,
+          description: t`This device's clock is wrong. Fix the date and time, and sync will continue automatically.`,
+        };
+      }
+      if (credentialBlock === "activation_failed") {
+        return {
+          kind: "error" as const,
+          label: t`Sync needs attention`,
+          description: t`Anarlog could not start cloud sync on this device. It will keep retrying.`,
+          detail: status?.configuration_error ?? null,
+        };
+      }
+      return {
+        kind: "error" as const,
+        label: t`Sync needs attention`,
+        description:
+          credentialBlock === "setup_required"
+            ? t`Set up your recovery key to start encrypted cloud sync.`
+            : credentialBlock === "keychain_access"
+              ? t`macOS could not access your recovery key. Repair Keychain access, then resume sync.`
+              : t`Anarlog could not start cloud sync on this device.`,
+      };
+    }
+    if (statusQuery.isError) {
+      return {
+        kind: "error" as const,
+        label: t`Sync status unavailable`,
+        description: t`Your notes remain available locally. Try again in a moment.`,
+      };
+    }
+    if (
+      status &&
+      (status.last_error_kind === "auth" ||
+        status.last_error_kind === "fatal" ||
+        status.consecutive_failures > 0)
+    ) {
+      return {
+        kind: "error" as const,
+        label: t`Sync needs attention`,
+        description:
+          status.last_error_kind === "auth"
+            ? t`Sign out and sign in again to resume cloud sync.`
+            : status.last_error_kind === "transient"
+              ? t`Anarlog will retry automatically.`
+              : t`Anarlog will keep retrying.`,
+      };
+    }
+    if (status?.activity_paused) {
+      return {
+        kind: "local" as const,
+        label: t`Saved locally`,
+        description: status.deferred_for_capture
+          ? t`Cloud sync resumes after this meeting finishes processing.`
+          : t`Cloud sync resumes when the current activity finishes.`,
+      };
+    }
+    if (status?.recovery_pending) {
+      return {
+        kind: status.recovery_delayed
+          ? ("error" as const)
+          : ("syncing" as const),
+        label: status.recovery_delayed
+          ? t`Cloud sync delayed`
+          : t`Restoring cloud sync...`,
+        description: status.recovery_delayed
+          ? t`Your notes remain available locally. Anarlog will keep retrying.`
+          : t`Your notes remain available locally.`,
+        detail: status.recovery_delayed
+          ? (status.recovery_error ?? null)
+          : null,
+      };
+    }
+    if (!status || !status.configured || !status.running) {
+      return {
+        kind: "syncing" as const,
+        label: t`Connecting...`,
+        description: t`Setting up encrypted cloud sync.`,
+        detail: status?.configuration_error ?? null,
+      };
+    }
+    if (
+      syncNowMutation.isPending ||
+      status.has_unsent_changes === true ||
+      status.last_sync_at_ms === null
+    ) {
+      return {
+        kind: "syncing" as const,
+        label: t`Syncing...`,
+        description: t`Sending and receiving your latest changes.`,
+      };
+    }
+    return {
+      kind: "synced" as const,
+      label: t`Synced`,
+      description: t`Last synced ${formatDistanceToNow(
+        new Date(status.last_sync_at_ms),
+        { addSuffix: true },
+      )}`,
+    };
+  })();
+  const statusIcon = (() => {
+    switch (statusView.kind) {
+      case "syncing":
+        return (
+          <ArrowsClockwise className="size-4 animate-spin text-blue-500" />
+        );
+      case "synced":
+        return <CheckCircle className="size-4 text-emerald-500" />;
+      case "error":
+        return <Warning className="size-4 text-amber-500" />;
+      case "paused":
+      case "local":
+        return <CloudSlash className="text-muted-foreground size-4" />;
+    }
+  })();
+  const mutationError =
+    setSyncEnabledMutation.error ??
+    e2eePreflightMutation.error ??
+    syncNowMutation.error;
+  const keychainRepairNeeded =
+    credentialBlock === "keychain_access" ||
+    (mutationError !== null && isKeychainAccessError(mutationError));
+  const deviceMutationError =
+    replaceDeviceMutation.error ?? removeDeviceMutation.error;
+  return (
+    <div className="flex flex-col gap-8">
+      <SettingsPageTitle title={<Trans>Sync</Trans>} />
+
+      <section className="flex flex-col gap-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex min-w-0 gap-3">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-full">
+              {statusIcon}
+            </div>
+            <div className="min-w-0">
+              <h3 className="text-sm font-medium">{statusView.label}</h3>
+              <p className="text-muted-foreground mt-1 text-xs leading-5">
+                {statusView.description}
+              </p>
+              {statusView.detail && (
+                <p className="text-muted-foreground mt-1 font-mono text-[11px] leading-4 break-words">
+                  {statusView.detail}
+                </p>
+              )}
+              {credentialBlock === "approval_pending" && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-3"
+                  onClick={() => setE2eeSetupOpen(true)}
+                >
+                  <Trans>Use recovery key instead</Trans>
+                </Button>
+              )}
+            </div>
+          </div>
+          <Switch
+            aria-label={t`Cloud sync`}
+            checked={syncSwitchChecked}
+            disabled={
+              setSyncEnabledMutation.isPending ||
+              e2eePreflightMutation.isPending ||
+              e2eeIdentityQuery.isLoading
+            }
+            onCheckedChange={(enabled) => {
+              // Drop the previous attempt's error so the shown error (and repair action) is this attempt's.
+              setSyncEnabledMutation.reset();
+              e2eePreflightMutation.reset();
+              if (enabled) {
+                e2eePreflightMutation.mutate();
+              } else {
+                setSyncEnabledMutation.mutate(false);
+              }
+            }}
+          />
+        </div>
+
+        {mutationError && (
+          <p className="text-xs text-red-500">{mutationError.message}</p>
+        )}
+
+        {keychainRepairNeeded && (
+          <div className="flex flex-col items-start gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={repairKeychainMutation.isPending}
+              onClick={() => repairKeychainMutation.mutate()}
+            >
+              {repairKeychainMutation.isPending && (
+                <CircleNotch className="size-3.5 animate-spin" />
+              )}
+              <Trans>Repair Keychain Access</Trans>
+            </Button>
+            {repairKeychainMutation.error && (
+              <p className="text-xs text-red-500">
+                {repairKeychainMutation.error.message}
+              </p>
+            )}
+          </div>
+        )}
+
+        <div className="flex items-center justify-between gap-4">
+          <p className="text-muted-foreground text-xs">
+            <Trans>Keep notes current automatically.</Trans>
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={
+              !syncPreferred ||
+              credentialBlock !== null ||
+              syncNowMutation.isPending ||
+              statusQuery.isFetching ||
+              !status?.configured ||
+              !status.running ||
+              status.activity_paused ||
+              status.recovery_pending === true
+            }
+            onClick={() => syncNowMutation.mutate()}
+          >
+            <ArrowsClockwise
+              className={cn([
+                "size-3.5",
+                syncNowMutation.isPending && "animate-spin",
+              ])}
+            />
+            <Trans>Sync now</Trans>
+          </Button>
+        </div>
+
+        <SyncHealthSection />
+
+        <SyncLog />
+      </section>
+
+      <section>
+        <div className="mb-4 flex items-center justify-between gap-4">
+          <h2 className="font-sans text-lg font-semibold">
+            <Trans>Devices</Trans>
+            {devicesQuery.data && (
+              <span className="text-muted-foreground ml-2 font-normal">
+                {usedDeviceSlots} / {devicesQuery.data.maxDevices}
+              </span>
+            )}
+          </h2>
+          <div className="flex items-center gap-2">
+            {devicesQuery.data &&
+              (usedDeviceSlots >= devicesQuery.data.maxDevices ||
+                credentialBlock === "device_limit") && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={openMoreDevicesMutation.isPending}
+                  onClick={() => openMoreDevicesMutation.mutate()}
+                >
+                  <Trans>Get more slots</Trans>
+                </Button>
+              )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setAddDeviceOpen(true)}
+            >
+              <Plus className="size-3.5" />
+              <Trans>Add device</Trans>
+            </Button>
+          </div>
+        </div>
+        <div className="border-border/60 divide-border/60 divide-y overflow-hidden rounded-xl border">
+          {devicesQuery.isPending && (
+            <div className="flex items-center justify-center px-4 py-5">
+              <CircleNotch
+                aria-label={t`Loading devices`}
+                className="text-muted-foreground size-4 animate-spin"
+              />
+            </div>
+          )}
+          {devicesQuery.isError && (
+            <div className="flex items-center justify-between gap-3 px-4 py-3">
+              <p className="text-xs text-red-500">
+                <Trans>Could not load your devices.</Trans>
+              </p>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={devicesQuery.isFetching}
+                onClick={() => void devicesQuery.refetch()}
+              >
+                <Trans>Retry</Trans>
+              </Button>
+            </div>
+          )}
+          {devicesQuery.data?.devices.map((device) => {
+            const current =
+              device.deviceFingerprint ===
+              deviceIdentityQuery.data?.fingerprint;
+            return (
+              <div
+                key={device.deviceFingerprint}
+                className="flex items-center gap-3 px-4 py-3"
+              >
+                <div className="min-w-0 flex-1">
+                  <DeviceTitle
+                    name={device.deviceName}
+                    current={current}
+                    onRename={
+                      current
+                        ? () => {
+                            renameDeviceMutation.reset();
+                            setRenamingDevice({
+                              fingerprint: device.deviceFingerprint,
+                              name: device.deviceName,
+                            });
+                          }
+                        : undefined
+                    }
+                  />
+                  <p className="text-muted-foreground text-[11px]">{t`Last seen ${formatDistanceToNow(new Date(device.lastSeenAt))}`}</p>
+                </div>
+                {!current && (
+                  <>
+                    {credentialBlock === "device_limit" && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={replaceDeviceMutation.isPending}
+                        onClick={() =>
+                          replaceDeviceMutation.mutate(device.deviceFingerprint)
+                        }
+                      >
+                        {replaceDeviceMutation.isPending &&
+                          replaceDeviceMutation.variables ===
+                            device.deviceFingerprint && (
+                            <CircleNotch className="size-3.5 animate-spin" />
+                          )}
+                        <Trans>Replace</Trans>
+                      </Button>
+                    )}
+                    {credentialBlock !== "device_limit" && (
+                      <DisconnectDeviceButton
+                        fingerprint={device.deviceFingerprint}
+                        isPending={removeDeviceMutation.isPending}
+                        pendingFingerprint={removeDeviceMutation.variables}
+                        onDisconnect={removeDeviceMutation.mutate}
+                      />
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })}
+          {devicesQuery.data?.pendingDevices.map((device) => {
+            const current =
+              device.deviceFingerprint ===
+              deviceIdentityQuery.data?.fingerprint;
+            return (
+              <div
+                key={device.requestId}
+                className="flex items-center gap-3 px-4 py-3"
+              >
+                <div className="min-w-0 flex-1">
+                  <DeviceTitle
+                    name={device.deviceName}
+                    current={current}
+                    onRename={
+                      current
+                        ? () => {
+                            renameDeviceMutation.reset();
+                            setRenamingDevice({
+                              fingerprint: device.deviceFingerprint,
+                              name: device.deviceName,
+                            });
+                          }
+                        : undefined
+                    }
+                  />
+                  <p className="text-muted-foreground text-[11px]">
+                    {device.status === "sealed"
+                      ? t`Connecting — waiting for this device to finish`
+                      : current
+                        ? t`Waiting for an existing device`
+                        : t`Connecting automatically`}
+                  </p>
+                </div>
+                {!current && device.status === "sealed" && (
+                  <span className="text-xs text-emerald-500">
+                    <Trans>Connecting</Trans>
+                  </span>
+                )}
+                {!current && (
+                  <DisconnectDeviceButton
+                    fingerprint={device.deviceFingerprint}
+                    isPending={removeDeviceMutation.isPending}
+                    pendingFingerprint={removeDeviceMutation.variables}
+                    onDisconnect={removeDeviceMutation.mutate}
+                  />
+                )}
+              </div>
+            );
+          })}
+          {!devicesQuery.isPending &&
+            !devicesQuery.isError &&
+            !devicesQuery.data?.devices.length &&
+            !devicesQuery.data?.pendingDevices.length && (
+              <p className="text-muted-foreground px-4 py-5 text-center text-xs">
+                <Trans>No devices registered yet.</Trans>
+              </p>
+            )}
+        </div>
+        {deviceMutationError && (
+          <p className="mt-2 text-xs text-red-500">
+            {deviceMutationError.message}
+          </p>
+        )}
+      </section>
+
+      <ConnectLocalLibraryDialog
+        key={session.user.id}
+        open={connectLibraryOpen}
+        onOpenChange={setConnectLibraryOpen}
+        accountUserId={session.user.id}
+        email={session.user.email ?? "this account"}
+        onConnected={async () => {
+          const current = await auth.getSessionForRequest();
+          if (current?.user.id !== session.user.id) return;
+          await applyCloudsyncPreference(current);
+          await queryClient.invalidateQueries({ queryKey: statusQueryKey });
+        }}
+      />
+      <E2eeSetupDialog
+        open={e2eeSetupOpen}
+        onOpenChange={setE2eeSetupOpen}
+        accountUserId={session.user.id}
+        accessToken={session.access_token}
+        onReady={() => {
+          setE2eeSetupOpen(false);
+          void e2eeIdentityQuery.refetch();
+          setSyncEnabledMutation.mutate(true);
+        }}
+      />
+      {renamingDevice ? (
+        <RenameDeviceDialog
+          key={renamingDevice.fingerprint}
+          name={renamingDevice.name}
+          pending={renameDeviceMutation.isPending}
+          error={renameDeviceMutation.error}
+          onOpenChange={(open) => {
+            if (!open && !renameDeviceMutation.isPending) {
+              setRenamingDevice(null);
+            }
+          }}
+          onRename={(name) =>
+            renameDeviceMutation.mutate({
+              fingerprint: renamingDevice.fingerprint,
+              name,
+            })
+          }
+        />
+      ) : null}
+      <Dialog open={addDeviceOpen} onOpenChange={setAddDeviceOpen}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>
+              <Trans>Add another device</Trans>
+            </DialogTitle>
+            <DialogDescription>
+              <Trans>
+                Install Anarlog and sign in with this account on the new device.
+                Keep this device online and the new device will connect
+                automatically.
+              </Trans>
+            </DialogDescription>
+          </DialogHeader>
+          <p className="text-muted-foreground text-xs leading-5">
+            <Trans>
+              Keep your recovery key saved somewhere safe. You can still use it
+              if another synced device is unavailable.
+            </Trans>
+          </p>
+          <DialogFooter>
+            <Button onClick={() => setAddDeviceOpen(false)}>
+              <Trans>Done</Trans>
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

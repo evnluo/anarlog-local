@@ -1,0 +1,114 @@
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler, handler::server::wrapper::Parameters,
+    model::*, service::RequestContext, tool, tool_handler, tool_router,
+};
+
+use crate::state::AppState;
+
+use super::prompts;
+use super::tools;
+
+#[derive(Clone)]
+pub struct ResearchMcpServer {
+    state: AppState,
+}
+
+impl ResearchMcpServer {
+    pub(super) fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+#[tool_router]
+impl ResearchMcpServer {
+    #[tool(
+        description = "Search the web using Exa. Returns relevant results for a given query.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn search(
+        &self,
+        Parameters(params): Parameters<anlg_exa::SearchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::search(&self.state, params).await
+    }
+
+    #[tool(
+        description = "Get the contents of web pages by URL. Returns the text content of the given URLs.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn get_contents(
+        &self,
+        Parameters(params): Parameters<anlg_exa::GetContentsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::get_contents(&self.state, params).await
+    }
+
+    #[tool(
+        description = "Read a URL and convert it to clean, LLM-friendly markdown text. Powered by Jina Reader.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn read_url(
+        &self,
+        Parameters(params): Parameters<anlg_jina::ReadUrlRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        tools::read_url(&self.state, params).await
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for ResearchMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_protocol_version(ProtocolVersion::V_2026_07_28)
+        .with_server_info(Implementation::new(
+            "anarlog-research",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Char research server. Provides tools for web search and content retrieval powered by Exa.",
+        )
+    }
+
+    async fn list_prompts(
+        &self,
+        _params: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+            "research_chat",
+            Some("System prompt for the Char research chat"),
+            None::<Vec<PromptArgument>>,
+        )]))
+    }
+
+    async fn get_prompt(
+        &self,
+        params: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        match params.name.as_str() {
+            "research_chat" => prompts::research_chat().map(Into::into),
+            _ => Err(McpError::invalid_params(
+                format!("Unknown prompt: {}", params.name),
+                None,
+            )),
+        }
+    }
+}

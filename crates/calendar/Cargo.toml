@@ -1,0 +1,28 @@
+[package]
+name = "calendar"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+specta = ["dep:specta"]
+
+[dependencies]
+anlg-api-client = { workspace = true }
+anlg-apple-calendar = { workspace = true, features = ["specta"] }
+anlg-calendar-interface = { workspace = true }
+anlg-google-calendar = { workspace = true, features = ["specta"] }
+anlg-outlook-calendar = { workspace = true, features = ["specta"] }
+
+chrono = { workspace = true, features = ["serde"] }
+chrono-tz = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+specta = { workspace = true, features = ["chrono"], optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = { workspace = true }

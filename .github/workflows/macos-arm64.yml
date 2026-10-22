@@ -1,0 +1,271 @@
+name: macOS Apple Silicon
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  ANARLOG_DISABLE_SENTRY: "1"
+
+jobs:
+  test-and-build:
+    name: test + build aarch64 app/dmg
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          lfs: true
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          targets: aarch64-apple-darwin
+          components: rustfmt,clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+          cache-on-failure: "true"
+          shared-key: macos-arm64
+
+      - name: Install Metal toolchain when required
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_major=$(xcodebuild -version | ruby -ne 'puts $1 if $_ =~ /Xcode (\d+)/')
+          if [[ "$xcode_major" -ge 26 ]]; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit production JavaScript dependencies
+        run: pnpm audit --prod --audit-level=moderate
+
+      - name: Build shared UI
+        run: pnpm --filter @anlg/ui build
+
+      - name: Verify local-edition formatting
+        run: >-
+          pnpm exec dprint check --allow-no-files
+          .github/workflows/macos-arm64.yml
+          Cargo.toml
+          apps/desktop/package.json
+          apps/desktop/src-tauri/Cargo.toml
+          packages/editor/package.json
+          pnpm-workspace.yaml
+          rust-toolchain.toml
+          skills/anarlog/SKILL.md
+          skills/anarlog/references/cli.md
+          skills/anarlog/references/errors.md
+          skills/anarlog/references/mcp.md
+          skills/anarlog/references/setup.md
+          crates/storage/src/global.rs
+          plugins/analytics/src/lib.rs
+          plugins/calendar/src/lib.rs
+          plugins/todo/src/lib.rs
+          plugins/tracing/src/utils.rs
+          plugins/tray/src/macos_position.rs
+          plugins/tray/src/menu_items/help_report_bug.rs
+          plugins/tray/src/menu_items/help_suggest_feature.rs
+          apps/desktop/src-tauri/tauri.conf.json
+          apps/desktop/src-tauri/src/db.rs
+          apps/desktop/src-tauri/src/embedded_cli.rs
+          apps/desktop/src-tauri/src/embedded_cli/tests.rs
+          apps/desktop/src-tauri/src/lib.rs
+          apps/desktop/src/ai/hooks/useLLMConnection.test.ts
+          apps/desktop/src/ai/hooks/useLLMConnection.ts
+          apps/desktop/src/ai/provider-routing.test.ts
+          apps/desktop/src/analytics.ts
+          apps/desktop/src/audio-player/provider.tsx
+          apps/desktop/src/audio-player/timeline.tsx
+          apps/desktop/src/auth/local-billing.tsx
+          apps/desktop/src/automations/starters.tsx
+          apps/desktop/src/chat/tools/index.test.ts
+          apps/desktop/src/chat/tools/index.ts
+          apps/desktop/src/chat/tools/types.ts
+          apps/desktop/src/chat/transport/use-transport.ts
+          apps/desktop/src/dictation/lifecycle.test.tsx
+          apps/desktop/src/dictation/lifecycle.tsx
+          apps/desktop/src/env.ts
+          apps/desktop/src/folders/folder-editor.tsx
+          apps/desktop/src/local-edition-config.test.ts
+          apps/desktop/src/local-edition.test.ts
+          apps/desktop/src/local-edition.ts
+          apps/desktop/src/main/lifecycle.tsx
+          apps/desktop/src/main/windows-title-bar.tsx
+          apps/desktop/src/main.tsx
+          apps/desktop/src/onboarding/config.tsx
+          apps/desktop/src/onboarding/final.tsx
+          apps/desktop/src/onboarding/index.tsx
+          apps/desktop/src/onboarding/welcome-note.constants.ts
+          apps/desktop/src/onboarding/welcome-note.test.ts
+          apps/desktop/src/onboarding/welcome-note.ts
+          apps/desktop/src/provider-boundary.test.tsx
+          apps/desktop/src/session-sharing/attachments.test.ts
+          apps/desktop/src/session/attachments.test.ts
+          apps/desktop/src/session/components/outer-header/index.tsx
+          apps/desktop/src/settings/ai/llm/shared.tsx
+          apps/desktop/src/settings/ai/stt/shared.tsx
+          apps/desktop/src/settings/appearance/app-icon.tsx
+          apps/desktop/src/settings/automations/index.tsx
+          apps/desktop/src/settings/automations/workflow-builder.tsx
+          apps/desktop/src/settings/dictionary/index.test.tsx
+          apps/desktop/src/settings/dictionary/index.tsx
+          apps/desktop/src/settings/dictation.tsx
+          apps/desktop/src/settings/general/app-settings.test.tsx
+          apps/desktop/src/settings/general/app-settings.tsx
+          apps/desktop/src/settings/general/index.tsx
+          apps/desktop/src/settings/privacy/index.test.tsx
+          apps/desktop/src/settings/privacy/index.tsx
+          apps/desktop/src/settings/queries.test.tsx
+          apps/desktop/src/settings/queries.ts
+          apps/desktop/src/services/event-listeners.test.tsx
+          apps/desktop/src/services/event-listeners.tsx
+          apps/desktop/src/shared/main-app-layout.test.tsx
+          apps/desktop/src/shared/main-app-layout.tsx
+          apps/desktop/src/shared/ui/resource-list/hooks.ts
+          apps/desktop/src/sidebar/automations.tsx
+          apps/desktop/src/sidebar/index.test.tsx
+          apps/desktop/src/sidebar/index.tsx
+          apps/desktop/src/sidebar/settings-nav-groups.ts
+          apps/desktop/src/sidebar/toast/index.test.tsx
+          apps/desktop/src/sidebar/toast/index.tsx
+          apps/desktop/src/sidebar/toast/registry.test.tsx
+          apps/desktop/src/sidebar/toast/registry.tsx
+          apps/desktop/src/stt/meeting-disclosure.ts
+          apps/desktop/src/templates/auto-form.tsx
+          apps/desktop/src/templates/template-form.tsx
+
+      - name: Type-check desktop
+        run: pnpm --filter @anlg/desktop typecheck
+
+      - name: Test local edition boundaries and dictation
+        run: >-
+          pnpm --filter @anlg/desktop exec vitest run
+          src/local-edition.test.ts
+          src/local-edition-config.test.ts
+          src/provider-boundary.test.tsx
+          src/ai/hooks/useLLMConnection.test.ts
+          src/ai/provider-routing.test.ts
+          src/chat/tools/index.test.ts
+          src/dictation/lifecycle.test.tsx
+          src/onboarding/welcome-note.test.ts
+          src/settings/general/app-settings.test.tsx
+          src/settings/privacy/index.test.tsx
+          src/settings/queries.test.tsx
+          src/settings/dictionary/index.test.tsx
+          src/services/event-listeners.test.tsx
+          src/sidebar/index.test.tsx
+          src/sidebar/toast/index.test.tsx
+          src/sidebar/toast/registry.test.tsx
+          src/automations/engine.test.ts
+
+      - name: Test independent storage boundaries
+        run: cargo test --locked -p storage -p tauri-plugin-tracing
+
+      - name: Compile permission helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p apps/desktop/src-tauri/binaries
+          swiftc plugins/permissions/swift/check-permissions.swift \
+            -o apps/desktop/src-tauri/binaries/check-permissions-aarch64-apple-darwin
+
+      - name: Build native Apple Silicon app
+        env:
+          CI: "false"
+          APPLE_SIGNING_IDENTITY: "-"
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: >-
+          pnpm --filter @anlg/desktop tauri build
+          --target aarch64-apple-darwin
+          --bundles app
+          --verbose
+
+      - name: Ad-hoc sign, inspect, and smoke-launch
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          app_candidates=(apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app)
+          if [[ ${#app_candidates[@]} -ne 1 ]]; then
+            echo "Expected one .app, found ${#app_candidates[@]}" >&2
+            exit 1
+          fi
+          app="${app_candidates[0]}"
+          binary="$app/Contents/MacOS/anarlog-local"
+          [[ -x "$binary" ]]
+
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" = "com.evnluo.anarlog-local"
+          test "$(plutil -extract CFBundleName raw -o - "$app/Contents/Info.plist")" = "Anarlog Local"
+          lipo -archs "$binary" | grep -Eq '(^| )arm64( |$)'
+
+          "$binary" --background > "$RUNNER_TEMP/anarlog-local-smoke.log" 2>&1 &
+          app_pid=$!
+          sleep 15
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            cat "$RUNNER_TEMP/anarlog-local-smoke.log"
+            echo "Anarlog Local exited during startup smoke test" >&2
+            exit 1
+          fi
+          kill "$app_pid"
+          wait "$app_pid" || true
+
+          dmg_dir="apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg"
+          rm -f "$dmg_dir"/*.dmg
+          mkdir -p "$dmg_dir"
+          dmg="$dmg_dir/Anarlog_Local_aarch64.dmg"
+          hdiutil create -volname "Anarlog Local" -srcfolder "$app" -ov -format UDZO "$dmg"
+
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$app" dist/Anarlog_Local_aarch64.app.zip
+          cp "$dmg" dist/
+          cp LICENSE LICENSING.md UPSTREAM.md CAPABILITIES.md THIRD_PARTY_NOTICES.md dist/
+          cp licenses/*.txt dist/
+          (cd dist && shasum -a 256 Anarlog_Local_aarch64.dmg Anarlog_Local_aarch64.app.zip > SHA256SUMS.txt)
+          codesign -dv --verbose=4 "$app" 2>&1 | tee dist/CODESIGN.txt
+          file "$binary" | tee dist/ARCHITECTURE.txt
+
+      - name: Upload verified macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: anarlog-local-macos-aarch64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

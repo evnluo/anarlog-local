@@ -1,0 +1,408 @@
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { NoteInput } from ".";
+
+import type { EditorView } from "~/store/zustand/tabs/schema";
+
+const hoisted = vi.hoisted(() => ({
+  editorTabs: [{ type: "raw" }, { type: "transcript" }] as EditorView[],
+  hotkeys: [] as Array<{ keys: string; callback: () => void }>,
+  enhancedHasProseMirror: true,
+  enhancedEditorProps: [] as Record<string, unknown>[],
+  focusAtTrailingEmptyLine: vi.fn(),
+  flushPendingChanges: vi.fn(),
+  onBeforeTabChange: vi.fn(),
+  rawEditorProps: [] as Record<string, unknown>[],
+  registerCanonicalSessionEditor: vi.fn(),
+  searchVisible: false,
+  sessionMode: "inactive",
+  unregisterCanonicalSessionEditor: vi.fn(),
+  updateSessionTabState: vi.fn(),
+}));
+
+vi.mock("./enhanced", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+
+  return {
+    Enhanced: React.forwardRef((props: Record<string, unknown>, ref) => {
+      hoisted.enhancedEditorProps.push(props);
+      React.useImperativeHandle(ref, () => createEditorRef());
+      return React.createElement(
+        "div",
+        { "data-testid": "enhanced-editor" },
+        React.createElement("button", { type: "button" }, "Retry summary"),
+        hoisted.enhancedHasProseMirror
+          ? React.createElement("div", { className: "ProseMirror" })
+          : null,
+      );
+    }),
+  };
+});
+
+vi.mock("./header", () => ({
+  Header: () => <div data-testid="folder-header" />,
+  SessionViewSwitcher: ({
+    currentTab,
+    editorTabs,
+    handleTabChange,
+    isTranscribing,
+  }: {
+    currentTab: EditorView;
+    editorTabs: EditorView[];
+    handleTabChange: (view: EditorView) => void;
+    isTranscribing?: boolean;
+  }) => (
+    <div>
+      <div data-testid="current-tab">{formatEditorView(currentTab)}</div>
+      <div data-testid="is-transcribing">{String(isTranscribing)}</div>
+      {editorTabs.map((editorTab) => (
+        <button
+          key={formatEditorView(editorTab)}
+          type="button"
+          onClick={() => handleTabChange(editorTab)}
+        >
+          {formatEditorView(editorTab)}
+        </button>
+      ))}
+    </div>
+  ),
+  useEditorTabs: () => hoisted.editorTabs,
+}));
+
+vi.mock("./raw", async () => {
+  const React = await vi.importActual<typeof import("react")>("react");
+
+  return {
+    RawEditor: React.forwardRef((props: Record<string, unknown>, ref) => {
+      hoisted.rawEditorProps.push(props);
+      React.useImperativeHandle(ref, () => createEditorRef());
+      return React.createElement(
+        "div",
+        { "data-testid": "raw-editor" },
+        React.createElement("div", {
+          className: "ProseMirror",
+          "data-testid": "mock-prosemirror",
+        }),
+      );
+    }),
+  };
+});
+
+vi.mock("./search/bar", () => ({
+  SearchBar: () => <div data-testid="search-bar" />,
+}));
+
+vi.mock("./search/context", () => ({
+  useSearch: () =>
+    hoisted.searchVisible
+      ? {
+          isVisible: true,
+          close: vi.fn(),
+        }
+      : null,
+}));
+
+vi.mock("./transcript", () => ({
+  Transcript: ({ editMode }: { editMode?: boolean }) => (
+    <div data-testid="transcript" data-edit-mode={String(editMode ?? false)} />
+  ),
+}));
+
+vi.mock("~/session/components/shared", () => ({
+  useCurrentNoteTab: () => ({ type: "raw" }),
+}));
+
+vi.mock("~/session-sharing/editor-activity", () => ({
+  registerCanonicalSessionEditor: hoisted.registerCanonicalSessionEditor,
+  unregisterCanonicalSessionEditor: hoisted.unregisterCanonicalSessionEditor,
+}));
+
+vi.mock("~/shared/hooks/useScrollPreservation", () => ({
+  useScrollPreservation: () => ({
+    onBeforeTabChange: hoisted.onBeforeTabChange,
+    scrollRef: { current: null },
+  }),
+}));
+
+vi.mock("~/store/zustand/tabs", () => ({
+  useTabs: vi.fn((selector: (state: unknown) => unknown) =>
+    selector({
+      updateSessionTabState: hoisted.updateSessionTabState,
+    }),
+  ),
+}));
+
+vi.mock("~/stt/contexts", () => ({
+  useListener: (
+    selector: (state: {
+      getSessionMode: (sessionId: string) => string;
+    }) => unknown,
+  ) =>
+    selector({
+      getSessionMode: () => hoisted.sessionMode,
+    }),
+}));
+
+vi.mock("~/stt/saved-capture-audio", () => ({
+  SavedCaptureAudioPrompt: () => null,
+}));
+
+vi.mock("react-hotkeys-hook", () => ({
+  useHotkeys: (keys: string, callback: () => void) => {
+    hoisted.hotkeys.push({ keys, callback });
+  },
+}));
+
+function formatEditorView(view: EditorView) {
+  return view.type === "enhanced" ? `enhanced:${view.id}` : view.type;
+}
+
+function createEditorRef() {
+  return {
+    view: null,
+    flushPendingChanges: hoisted.flushPendingChanges,
+    commands: {
+      focus: () => {},
+      focusAtStart: () => {},
+      focusAtTrailingEmptyLine: hoisted.focusAtTrailingEmptyLine,
+      focusAtPixelWidth: () => {},
+      insertAtStartAndFocus: () => {},
+      replaceContent: () => {},
+      setSearch: () => {},
+      replace: () => {},
+    },
+  };
+}
+
+function renderNoteInput({
+  currentTab = { type: "raw" },
+  handleTabChange = vi.fn(),
+  transcriptEditMode = false,
+  eventTitle,
+  eventDescription,
+}: {
+  currentTab?: EditorView;
+  handleTabChange?: (view: EditorView) => void;
+  transcriptEditMode?: boolean;
+  eventTitle?: string;
+  eventDescription?: string;
+} = {}) {
+  return {
+    handleTabChange,
+    ...render(
+      <NoteInput
+        tab={{
+          active: true,
+          id: "session-1",
+          pinned: false,
+          slotId: "slot-1",
+          state: { autoStart: null, view: currentTab },
+          type: "sessions",
+        }}
+        rawMd="stored memo"
+        sessionTitle="Stored title"
+        eventTitle={eventTitle}
+        eventDescription={eventDescription}
+        editorTabs={hoisted.editorTabs}
+        currentTab={currentTab}
+        handleTabChange={handleTabChange}
+        transcriptEditMode={transcriptEditMode}
+      />,
+    ),
+  };
+}
+
+describe("NoteInput tab selection", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  beforeEach(() => {
+    hoisted.editorTabs = [{ type: "raw" }, { type: "transcript" }];
+    hoisted.hotkeys = [];
+    hoisted.enhancedHasProseMirror = true;
+    hoisted.enhancedEditorProps = [];
+    hoisted.focusAtTrailingEmptyLine.mockClear();
+    hoisted.flushPendingChanges.mockClear();
+    hoisted.onBeforeTabChange.mockClear();
+    hoisted.rawEditorProps = [];
+    hoisted.registerCanonicalSessionEditor.mockClear();
+    hoisted.searchVisible = false;
+    hoisted.sessionMode = "inactive";
+    hoisted.unregisterCanonicalSessionEditor.mockClear();
+    hoisted.updateSessionTabState.mockClear();
+  });
+
+  it("does not move the header ahead of the parent tab state", () => {
+    const { handleTabChange } = renderNoteInput();
+
+    fireEvent.click(screen.getByRole("button", { name: "transcript" }));
+
+    expect(handleTabChange).toHaveBeenCalledWith({ type: "transcript" });
+    expect(screen.getByTestId("current-tab").textContent).toBe("raw");
+  });
+
+  it.each([
+    ["mod+alt+right", { type: "transcript" }],
+    ["mod+alt+left", { type: "enhanced", id: "summary-1" }],
+  ])("switches note views with %s", (keys, expected) => {
+    hoisted.editorTabs = [
+      { type: "enhanced", id: "summary-1" },
+      { type: "raw" },
+      { type: "transcript" },
+    ];
+    const { handleTabChange } = renderNoteInput();
+
+    hoisted.hotkeys.find((hotkey) => hotkey.keys === keys)?.callback();
+
+    expect(handleTabChange).toHaveBeenCalledWith(expected);
+    expect(hoisted.onBeforeTabChange).toHaveBeenCalledOnce();
+  });
+
+  it("reflects the parent-selected tab in the header", () => {
+    const { rerender, handleTabChange } = renderNoteInput();
+    const currentTab = { type: "transcript" } satisfies EditorView;
+
+    rerender(
+      <NoteInput
+        tab={{
+          active: true,
+          id: "session-1",
+          pinned: false,
+          slotId: "slot-1",
+          state: { autoStart: null, view: currentTab },
+          type: "sessions",
+        }}
+        rawMd="stored memo"
+        sessionTitle="Stored title"
+        editorTabs={hoisted.editorTabs}
+        currentTab={currentTab}
+        handleTabChange={handleTabChange}
+      />,
+    );
+
+    expect(screen.getByTestId("current-tab").textContent).toBe("transcript");
+  });
+
+  it.each([
+    ["active", "false"],
+    ["finalizing", "true"],
+    ["running_batch", "true"],
+  ])("reports transcription progress while %s", (mode, expected) => {
+    hoisted.sessionMode = mode;
+
+    renderNoteInput();
+
+    expect(screen.getByTestId("is-transcribing").textContent).toBe(expected);
+  });
+
+  it("passes hydrated session content to the memo editor", () => {
+    renderNoteInput({
+      eventTitle: "Customer discovery",
+      eventDescription: "Learn about the prospect's workflow",
+    });
+
+    expect(
+      hoisted.rawEditorProps[hoisted.rawEditorProps.length - 1],
+    ).toMatchObject({
+      rawMd: "stored memo",
+      sessionTitle: "Stored title",
+      eventTitle: "Customer discovery",
+      eventDescription: "Learn about the prospect's workflow",
+    });
+  });
+
+  it("tracks the mounted memo editor until its view is disposed", () => {
+    renderNoteInput();
+    const props = hoisted.rawEditorProps[hoisted.rawEditorProps.length - 1] as {
+      onViewReady?: (view: unknown) => void;
+      onViewDisposed?: (view: unknown) => void;
+    };
+    const view = { hasFocus: () => true };
+
+    props.onViewReady?.(view);
+    expect(hoisted.registerCanonicalSessionEditor).toHaveBeenCalledWith(
+      "session-1",
+      view,
+      expect.any(Function),
+    );
+
+    props.onViewDisposed?.(view);
+    expect(hoisted.unregisterCanonicalSessionEditor).toHaveBeenCalledWith(
+      "session-1",
+      view,
+    );
+  });
+
+  it("tracks the mounted summary editor because it can update the session title", () => {
+    hoisted.editorTabs = [
+      { type: "enhanced", id: "summary-1" },
+      { type: "raw" },
+    ];
+    renderNoteInput({
+      currentTab: { type: "enhanced", id: "summary-1" },
+    });
+    const props = hoisted.enhancedEditorProps[
+      hoisted.enhancedEditorProps.length - 1
+    ] as { onViewReady?: (view: unknown) => void };
+    const view = { hasFocus: () => true };
+
+    props.onViewReady?.(view);
+
+    expect(hoisted.registerCanonicalSessionEditor).toHaveBeenCalledWith(
+      "session-1",
+      view,
+      expect.any(Function),
+    );
+  });
+
+  it("focuses the trailing body line when blank editor space is clicked", () => {
+    renderNoteInput();
+
+    const scrollContainer = screen.getByTestId("raw-editor").parentElement;
+    expect(scrollContainer).not.toBeNull();
+
+    fireEvent.mouseDown(scrollContainer!, { button: 0 });
+
+    expect(hoisted.focusAtTrailingEmptyLine).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets ProseMirror handle clicks inside the document", () => {
+    renderNoteInput();
+
+    fireEvent.mouseDown(screen.getByTestId("mock-prosemirror"), { button: 0 });
+
+    expect(hoisted.focusAtTrailingEmptyLine).not.toHaveBeenCalled();
+  });
+
+  it("preserves controls when the enhanced view has no editor", () => {
+    hoisted.editorTabs = [
+      { type: "enhanced", id: "summary-1" },
+      { type: "raw" },
+    ];
+    hoisted.enhancedHasProseMirror = false;
+    renderNoteInput({
+      currentTab: { type: "enhanced", id: "summary-1" },
+    });
+
+    const wasNotCancelled = fireEvent.mouseDown(
+      screen.getByRole("button", { name: "Retry summary" }),
+      { button: 0 },
+    );
+
+    expect(wasNotCancelled).toBe(true);
+    expect(hoisted.focusAtTrailingEmptyLine).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "shows the transcript search bar only when find is open (%s)",
+    (searchVisible) => {
+      hoisted.searchVisible = searchVisible;
+
+      renderNoteInput({ currentTab: { type: "transcript" } });
+
+      expect(screen.queryByTestId("search-bar") !== null).toBe(searchVisible);
+    },
+  );
+});

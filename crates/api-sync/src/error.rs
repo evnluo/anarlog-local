@@ -1,0 +1,322 @@
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, SyncError>;
+
+#[derive(Debug, Error)]
+pub enum SyncError {
+    #[error("Invalid request: {0}")]
+    BadRequest(String),
+
+    #[error("Anarlog Pro is required for CloudSync")]
+    ProPlanRequired,
+
+    #[error("A newer Anarlog version is required for encrypted CloudSync")]
+    CloudsyncUpgradeRequired,
+
+    #[error("This account is protected by a different E2EE recovery key")]
+    E2eeKeyMismatch,
+
+    #[error("Set up encrypted sync on an existing device first")]
+    E2eeEnrollmentRequiresExistingKey,
+
+    #[error("E2EE device enrollment is unavailable")]
+    E2eeEnrollmentUnavailable,
+
+    #[error("E2EE device enrollment is already approved")]
+    E2eeEnrollmentConflict,
+
+    #[error("CloudSync device limit reached")]
+    SyncDeviceLimitReached,
+
+    #[error("E2EE freshness witness access is not permitted")]
+    E2eeWitnessForbidden,
+
+    #[error("E2EE freshness witness is not initialized")]
+    E2eeWitnessUninitialized,
+
+    #[error("Cloud state changed; pull before retrying")]
+    E2eeReplicaBaseChanged,
+
+    #[error("Encrypted sync is busy; retry later")]
+    E2eeWitnessBusy,
+
+    #[error("E2EE freshness witness is unavailable")]
+    E2eeWitnessServiceUnavailable,
+
+    #[error("Shared note publication is not permitted")]
+    SnapshotPublicationForbidden,
+
+    #[error("Shared note changed")]
+    SnapshotChanged,
+
+    #[error("Shared note service is unavailable")]
+    SnapshotServiceUnavailable,
+
+    #[error("Shared note is unavailable")]
+    SharedNoteNotFound,
+
+    #[error("Shared note invitation email is unavailable")]
+    InvitationEmailUnavailable,
+
+    #[error("Shared note recap email is unavailable")]
+    RecapEmailUnavailable,
+
+    #[error("CloudSync credential service is unavailable")]
+    Upstream,
+
+    #[error("Attachment backup access is not permitted")]
+    AttachmentBackupForbidden,
+
+    #[error("Attachment backup is unavailable")]
+    AttachmentBackupNotFound,
+
+    #[error("Attachment backup changed")]
+    AttachmentBackupConflict,
+
+    #[error("Attachment backup dependency appeared")]
+    AttachmentBackupDependencyAppeared,
+
+    #[error("Attachment backup deletion was canceled")]
+    AttachmentBackupDeleteCancelled,
+
+    #[error("Attachment backup deletion can no longer be canceled")]
+    AttachmentBackupDeleteTooLate,
+
+    #[error("Attachment backup quota is exhausted")]
+    AttachmentBackupQuotaExceeded,
+
+    #[error("Attachment backup service is unavailable")]
+    AttachmentBackupServiceUnavailable,
+
+    #[error("Attachment backup verification is busy")]
+    AttachmentBackupVerificationBusy,
+
+    #[error("Shared attachment access is not permitted")]
+    SharedAttachmentForbidden,
+
+    #[error("Shared attachment is unavailable")]
+    SharedAttachmentNotFound,
+
+    #[error("Shared attachment changed")]
+    SharedAttachmentConflict,
+
+    #[error("Shared attachment quota is exhausted")]
+    SharedAttachmentQuotaExceeded,
+
+    #[error("Shared attachment service is unavailable")]
+    SharedAttachmentServiceUnavailable,
+
+    #[error("Shared attachment verification is busy")]
+    SharedAttachmentVerificationBusy,
+
+    #[error("Meeting device is not a registered sync device")]
+    MeetingDeviceNotRegistered,
+
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+impl IntoResponse for SyncError {
+    fn into_response(self) -> Response {
+        let retry_after = matches!(self, Self::E2eeWitnessBusy);
+        let (status, code, message) = match self {
+            Self::E2eeWitnessBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "e2ee_witness_busy",
+                "Encrypted sync is busy; retry later".to_string(),
+            ),
+            Self::E2eeReplicaBaseChanged => (
+                StatusCode::CONFLICT,
+                "e2ee_replica_base_changed",
+                "Cloud state changed; pull before retrying".to_string(),
+            ),
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
+            Self::ProPlanRequired => (
+                StatusCode::FORBIDDEN,
+                "subscription_required",
+                "Anarlog Pro is required for CloudSync".to_string(),
+            ),
+            Self::CloudsyncUpgradeRequired => (
+                StatusCode::UPGRADE_REQUIRED,
+                "cloudsync_upgrade_required",
+                "Update Anarlog to continue using encrypted CloudSync".to_string(),
+            ),
+            Self::E2eeKeyMismatch => (
+                StatusCode::CONFLICT,
+                "e2ee_key_mismatch",
+                "This account is protected by a different E2EE recovery key".to_string(),
+            ),
+            Self::E2eeEnrollmentRequiresExistingKey => (
+                StatusCode::CONFLICT,
+                "e2ee_enrollment_requires_existing_key",
+                "Set up encrypted sync on an existing device first".to_string(),
+            ),
+            Self::E2eeEnrollmentUnavailable => (
+                StatusCode::NOT_FOUND,
+                "e2ee_enrollment_unavailable",
+                "E2EE device enrollment is unavailable".to_string(),
+            ),
+            Self::E2eeEnrollmentConflict => (
+                StatusCode::CONFLICT,
+                "e2ee_enrollment_conflict",
+                "E2EE device enrollment is already approved".to_string(),
+            ),
+            Self::SyncDeviceLimitReached => (
+                StatusCode::FORBIDDEN,
+                "sync_device_limit_reached",
+                "Your plan's sync device limit is reached; remove a device before syncing here"
+                    .to_string(),
+            ),
+            Self::E2eeWitnessForbidden => (
+                StatusCode::FORBIDDEN,
+                "e2ee_witness_forbidden",
+                "E2EE freshness witness access is not permitted".to_string(),
+            ),
+            Self::E2eeWitnessUninitialized => (
+                StatusCode::CONFLICT,
+                "e2ee_witness_uninitialized",
+                "Open an existing trusted device before setting up encrypted sync on this device"
+                    .to_string(),
+            ),
+            Self::E2eeWitnessServiceUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                "e2ee_witness_unavailable",
+                "E2EE freshness witness is unavailable".to_string(),
+            ),
+            Self::SnapshotPublicationForbidden => (
+                StatusCode::FORBIDDEN,
+                "shared_note_publication_forbidden",
+                "Shared note publication is not permitted".to_string(),
+            ),
+            Self::SnapshotChanged => (
+                StatusCode::CONFLICT,
+                "snapshot_conflict",
+                "Shared note changed; update Anarlog and reload before publishing again"
+                    .to_string(),
+            ),
+            Self::SnapshotServiceUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                "shared_note_service_unavailable",
+                "Shared note service is unavailable".to_string(),
+            ),
+            Self::SharedNoteNotFound => (
+                StatusCode::NOT_FOUND,
+                "shared_note_not_found",
+                "Shared note is unavailable".to_string(),
+            ),
+            Self::InvitationEmailUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                "shared_note_invitation_email_unavailable",
+                "Shared note invitation email is unavailable".to_string(),
+            ),
+            Self::RecapEmailUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                "shared_note_recap_email_unavailable",
+                "Shared note recap email is unavailable".to_string(),
+            ),
+            Self::Upstream => (
+                StatusCode::BAD_GATEWAY,
+                "cloudsync_credential_service_unavailable",
+                "CloudSync credential service is unavailable".to_string(),
+            ),
+            Self::AttachmentBackupForbidden => (
+                StatusCode::FORBIDDEN,
+                "attachment_backup_forbidden",
+                "Attachment backup access is not permitted".to_string(),
+            ),
+            Self::AttachmentBackupNotFound => (
+                StatusCode::NOT_FOUND,
+                "attachment_backup_not_found",
+                "Attachment backup is unavailable".to_string(),
+            ),
+            Self::AttachmentBackupConflict => (
+                StatusCode::CONFLICT,
+                "attachment_backup_conflict",
+                "Attachment backup changed".to_string(),
+            ),
+            Self::AttachmentBackupDependencyAppeared => (
+                StatusCode::CONFLICT,
+                "attachment_backup_dependency_appeared",
+                "Attachment backup dependency appeared".to_string(),
+            ),
+            Self::AttachmentBackupDeleteCancelled => (
+                StatusCode::CONFLICT,
+                "attachment_backup_delete_cancelled",
+                "Attachment backup deletion was canceled".to_string(),
+            ),
+            Self::AttachmentBackupDeleteTooLate => (
+                StatusCode::CONFLICT,
+                "attachment_backup_delete_too_late",
+                "Attachment backup deletion can no longer be canceled".to_string(),
+            ),
+            Self::AttachmentBackupQuotaExceeded => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "attachment_backup_quota_exceeded",
+                "Attachment backup quota is exhausted".to_string(),
+            ),
+            Self::AttachmentBackupServiceUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                "attachment_backup_service_unavailable",
+                "Attachment backup service is unavailable".to_string(),
+            ),
+            Self::AttachmentBackupVerificationBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "attachment_backup_verification_busy",
+                "Attachment backup verification is busy".to_string(),
+            ),
+            Self::SharedAttachmentForbidden => (
+                StatusCode::FORBIDDEN,
+                "shared_attachment_forbidden",
+                "Shared attachment access is not permitted".to_string(),
+            ),
+            Self::SharedAttachmentNotFound => (
+                StatusCode::NOT_FOUND,
+                "shared_attachment_not_found",
+                "Shared attachment is unavailable".to_string(),
+            ),
+            Self::SharedAttachmentConflict => (
+                StatusCode::CONFLICT,
+                "shared_attachment_conflict",
+                "Shared attachment changed".to_string(),
+            ),
+            Self::SharedAttachmentQuotaExceeded => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "shared_attachment_quota_exceeded",
+                "Shared attachment quota is exhausted".to_string(),
+            ),
+            Self::SharedAttachmentServiceUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                "shared_attachment_service_unavailable",
+                "Shared attachment service is unavailable".to_string(),
+            ),
+            Self::SharedAttachmentVerificationBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shared_attachment_verification_busy",
+                "Shared attachment verification is busy".to_string(),
+            ),
+            Self::MeetingDeviceNotRegistered => (
+                StatusCode::NOT_FOUND,
+                "meeting_device_not_registered",
+                "This device is not a registered sync device".to_string(),
+            ),
+            Self::Internal(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_server_error",
+                message,
+            ),
+        };
+
+        let mut response = anlg_api_error::error_response(status, code, &message);
+        if retry_after {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
+    }
+}

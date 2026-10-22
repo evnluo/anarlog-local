@@ -1,0 +1,345 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime};
+
+use anlg_audio::AudioProvider;
+use anlg_transcript::IdentityAssignment;
+
+use crate::{ListenerRuntime, LiveTranscriptEngine, TranscriptionMode};
+
+pub const SESSION_SUPERVISOR_PREFIX: &str = "session_supervisor_";
+
+pub fn session_span(session_id: &str) -> tracing::Span {
+    tracing::info_span!("session", anarlog.session.id = %session_id)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct SessionParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub retain_audio: Option<bool>,
+    pub languages: Vec<anlg_language::Language>,
+    pub onboarding: bool,
+    #[serde(default)]
+    pub transcription_mode: TranscriptionMode,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub mic_device: Option<String>,
+    #[serde(default)]
+    pub participant_human_ids: Vec<String>,
+    #[serde(default)]
+    pub self_human_id: Option<String>,
+    /// Persisted speaker identities of the transcript being captured, so the
+    /// live segments name speakers the same way the settled render does.
+    #[serde(default)]
+    pub speaker_assignments: Vec<IdentityAssignment>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct SessionConfigUpdate {
+    pub session_id: String,
+    pub languages: Vec<anlg_language::Language>,
+    #[serde(default)]
+    pub participant_human_ids: Vec<String>,
+    #[serde(default)]
+    pub self_human_id: Option<String>,
+    #[serde(default)]
+    pub speaker_assignments: Vec<IdentityAssignment>,
+}
+
+// The single requested-to-effective transcription mode policy: every capture
+// path (plugin capture, listener root, direct listener users) resolves
+// through this function, so provider/model/language/platform decisions cannot
+// diverge between layers.
+pub fn resolve_transcription_mode(
+    requested: TranscriptionMode,
+    base_url: &str,
+    model: &str,
+    languages: &[anlg_language::Language],
+) -> TranscriptionMode {
+    use owhisper_client::{AdapterKind, Provider};
+
+    if requested == TranscriptionMode::Batch {
+        return TranscriptionMode::Batch;
+    }
+
+    if let Some(model) = anlg_transcribe_soniqo::local_model_from_request(base_url, model) {
+        return if model.supports_live_on_current_platform() && model.supports_languages(languages) {
+            TranscriptionMode::Live
+        } else {
+            TranscriptionMode::Batch
+        };
+    }
+
+    if anlg_transcribe_soniqo::is_local_base_url(base_url) {
+        return TranscriptionMode::Batch;
+    }
+
+    if let Some(model) = anlg_transcribe_speechanalyzer::local_model_from_request(base_url, model) {
+        return if model.supports_live_on_current_platform() && model.supports_languages(languages) {
+            TranscriptionMode::Live
+        } else {
+            TranscriptionMode::Batch
+        };
+    }
+
+    if anlg_transcribe_speechanalyzer::is_local_base_url(base_url) {
+        return TranscriptionMode::Batch;
+    }
+
+    let adapter_kind = AdapterKind::from_url_and_languages(base_url, languages, Some(model));
+
+    if adapter_kind == AdapterKind::OpenAI && model != Provider::OpenAI.default_live_model() {
+        return TranscriptionMode::Batch;
+    }
+
+    if adapter_kind == AdapterKind::ElevenLabs
+        && model == Provider::ElevenLabs.default_batch_model()
+    {
+        return TranscriptionMode::Batch;
+    }
+
+    if adapter_kind == AdapterKind::GoogleGenerativeAi
+        && !owhisper_client::GoogleGenerativeAiAdapter::is_live_model(model)
+    {
+        return TranscriptionMode::Batch;
+    }
+
+    if !adapter_kind.has_live_mode() {
+        return TranscriptionMode::Batch;
+    }
+
+    if adapter_kind.is_supported_languages_live(languages, Some(model)) {
+        TranscriptionMode::Live
+    } else {
+        TranscriptionMode::Batch
+    }
+}
+
+impl SessionParams {
+    pub fn effective_transcription_mode(&self) -> TranscriptionMode {
+        resolve_transcription_mode(
+            self.transcription_mode,
+            &self.base_url,
+            &self.model,
+            &self.languages,
+        )
+    }
+
+    pub fn uses_local_soniqo_live_model(&self) -> bool {
+        anlg_transcribe_soniqo::local_model_from_request(&self.base_url, &self.model)
+            .is_some_and(|model| model.supports_live())
+    }
+
+    pub fn uses_local_apple_speech_live_model(&self) -> bool {
+        anlg_transcribe_speechanalyzer::local_model_from_request(&self.base_url, &self.model)
+            .is_some_and(|model| model.supports_live())
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionContext {
+    pub runtime: Arc<dyn ListenerRuntime>,
+    pub audio: Arc<dyn AudioProvider>,
+    pub requested_transcription_mode: TranscriptionMode,
+    pub params: SessionParams,
+    pub app_dir: PathBuf,
+    pub started_at_instant: Instant,
+    pub started_at_system: SystemTime,
+    /// The live transcript outlives any one listener: a reconnecting listener resumes it so the
+    /// audio it replays cannot finalize words twice and segments continue across the gap.
+    pub live_transcript: SharedLiveTranscript,
+}
+
+pub type SharedLiveTranscript = Arc<Mutex<Option<LiveTranscriptEngine>>>;
+
+pub fn session_supervisor_name(session_id: &str) -> String {
+    format!("{}{}", SESSION_SUPERVISOR_PREFIX, session_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_params(base_url: &str, model: &str, mode: TranscriptionMode) -> SessionParams {
+        SessionParams {
+            session_id: "session".to_string(),
+            retain_audio: None,
+            languages: vec![],
+            onboarding: false,
+            transcription_mode: mode,
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            keywords: vec![],
+            mic_device: None,
+            participant_human_ids: vec![],
+            self_human_id: None,
+            speaker_assignments: vec![],
+        }
+    }
+
+    #[test]
+    fn effective_transcription_mode_by_provider_and_model() {
+        let soniqo_loopback_expected = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            TranscriptionMode::Live
+        } else {
+            TranscriptionMode::Batch
+        };
+
+        for (base_url, model, mode, languages, expected, label) in [
+            (
+                anlg_transcribe_soniqo::LOCAL_BASE_URL,
+                "soniqo-parakeet-streaming",
+                TranscriptionMode::Batch,
+                vec![],
+                TranscriptionMode::Batch,
+                "explicit batch is kept",
+            ),
+            (
+                anlg_transcribe_soniqo::LOCAL_BASE_URL,
+                "soniqo-parakeet-batch",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Batch,
+                "soniqo batch models forced to batch",
+            ),
+            (
+                "http://localhost:50060/v1",
+                "soniqo-parakeet-streaming",
+                TranscriptionMode::Live,
+                vec![],
+                soniqo_loopback_expected,
+                "soniqo loopback base url",
+            ),
+            (
+                anlg_transcribe_soniqo::LOCAL_BASE_URL,
+                "soniqo-parakeet-streaming",
+                TranscriptionMode::Live,
+                vec![anlg_language::ISO639::Ko.into()],
+                TranscriptionMode::Batch,
+                "soniqo live rejected for unsupported language",
+            ),
+            (
+                "https://api.openai.com/v1",
+                "gpt-live-transcribe",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Live,
+                "openai live model stays live",
+            ),
+            (
+                "https://api.openai.com/v1",
+                "whisper-1",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Batch,
+                "openai batch models forced to batch",
+            ),
+            (
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Batch,
+                "elevenlabs scribe_v2 forced to batch",
+            ),
+            (
+                "https://api.elevenlabs.io/v1",
+                "scribe_v2_realtime",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Live,
+                "elevenlabs scribe_v2_realtime stays live",
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-3.5-transcribe-live",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Live,
+                "gemini transcribe live stays live",
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-3.5-transcribe",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Batch,
+                "gemini file model forced to batch",
+            ),
+            (
+                "https://api.groq.com/openai/v1",
+                "whisper-large-v3",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Batch,
+                "adapters without live mode forced to batch",
+            ),
+            (
+                "https://api.deepgram.com/v1",
+                "nova-3-general",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Live,
+                "realtime providers stay live",
+            ),
+            (
+                anlg_transcribe_soniqo::LOCAL_BASE_URL,
+                "missing-model",
+                TranscriptionMode::Live,
+                vec![],
+                TranscriptionMode::Batch,
+                "invalid soniqo model defaults to batch",
+            ),
+        ] {
+            let mut params = session_params(base_url, model, mode);
+            params.languages = languages;
+
+            assert_eq!(
+                params.effective_transcription_mode(),
+                expected,
+                "case: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn uses_local_soniqo_live_model_only_for_streaming_model() {
+        let params = session_params(
+            anlg_transcribe_soniqo::LOCAL_BASE_URL,
+            "soniqo-parakeet-streaming",
+            TranscriptionMode::Live,
+        );
+        assert!(params.uses_local_soniqo_live_model());
+
+        let params = session_params(
+            anlg_transcribe_soniqo::LOCAL_BASE_URL,
+            "soniqo-parakeet-batch",
+            TranscriptionMode::Live,
+        );
+        assert!(!params.uses_local_soniqo_live_model());
+    }
+
+    #[test]
+    fn deserializes_missing_transcription_mode_as_live() {
+        let value = serde_json::json!({
+            "session_id": "session",
+            "languages": [],
+            "onboarding": false,
+            "model": "nova-3-general",
+            "base_url": "https://api.deepgram.com/v1",
+            "api_key": "test-key",
+            "keywords": [],
+        });
+
+        let params: SessionParams = serde_json::from_value(value).unwrap();
+
+        assert_eq!(params.transcription_mode, TranscriptionMode::Live);
+    }
+}

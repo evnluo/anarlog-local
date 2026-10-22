@@ -1,0 +1,391 @@
+import type { FloatingDictationState } from "@anlg/plugin-windows";
+
+import {
+  DEFAULT_FLOATING_OVERLAY_SETTINGS,
+  type FloatingOverlaySettings,
+  type LiveCaptionPosition,
+} from "./settings";
+import type { FloatingSpeakerLabels } from "./speaker-labels";
+
+import type { ListenerStore } from "~/store/zustand/listener";
+import {
+  getCaptureWarning,
+  isLiveTranscriptInterrupted,
+} from "~/store/zustand/listener/general-shared";
+import { LIVE_TRANSCRIPT_PREVIEW_SEGMENT_LIMIT } from "~/store/zustand/listener/transcript";
+import { SegmentKeyUtils, type RenderLabelContext } from "~/stt/live-segment";
+import { getLiveTranscriptPausedMessage } from "~/stt/live-transcript-interrupted";
+
+export type ListenerState = ReturnType<ListenerStore["getState"]>;
+type FloatingBarStatus = "recording" | "reconnecting" | "error";
+type FloatingBarColorScheme = "light" | "dark";
+
+export type FloatingTranscriptBubble = {
+  id: string;
+  speakerLabel: string;
+  text: string;
+  isSelf: boolean;
+  isFinal: boolean;
+  startMs: number;
+  endMs: number;
+  overlapsPrevious: boolean;
+  overlapsNext: boolean;
+};
+
+export type FloatingRouteState = {
+  dictation?: FloatingDictationState | null;
+  sessionId: string;
+  title: string;
+  amplitude: number;
+  status: FloatingBarStatus;
+  colorScheme: FloatingBarColorScheme;
+  opacity: number;
+  liveCaptionOpacity: number;
+  liveCaptionWidth: number;
+  liveCaptionLineCount: number;
+  liveCaptionPosition: LiveCaptionPosition;
+  liveCaptionMinimized: boolean;
+  liveCaptionToggleVisible: boolean;
+  transcriptBubbles: FloatingTranscriptBubble[];
+  transcriptNotice?: string | null;
+};
+const FLOATING_TRANSCRIPT_OVERLAP_THRESHOLD_MS = 300;
+
+export function getFloatingRouteState(
+  state: ListenerState,
+  {
+    sessionId,
+    colorScheme = "dark",
+    settings = DEFAULT_FLOATING_OVERLAY_SETTINGS,
+    liveCaptionToggleVisible = false,
+    sessionTitle,
+    speakerLabelContext,
+    speakerLabels,
+    transcriptBubbles,
+    sttProvider,
+  }: {
+    sttProvider?: string | null;
+    sessionId?: string;
+    colorScheme?: FloatingBarColorScheme;
+    settings?: FloatingOverlaySettings;
+    liveCaptionToggleVisible?: boolean;
+    sessionTitle?: string | null;
+    speakerLabelContext?: RenderLabelContext;
+    speakerLabels?: FloatingSpeakerLabels;
+    transcriptBubbles?: FloatingTranscriptBubble[];
+  } = {},
+): FloatingRouteState | null {
+  if (state.live.status !== "active") {
+    return null;
+  }
+
+  if (!state.live.sessionId) {
+    return null;
+  }
+
+  if (sessionId && state.live.sessionId !== sessionId) {
+    return null;
+  }
+
+  return {
+    sessionId: state.live.sessionId,
+    title: getFloatingTitle(sessionTitle),
+    amplitude: Math.min(
+      Math.hypot(state.live.amplitude.mic, state.live.amplitude.speaker),
+      1,
+    ),
+    status: getCaptureWarning(state.live) ? "error" : "recording",
+    colorScheme,
+    opacity: settings.floatingBarOpacity,
+    liveCaptionOpacity: settings.liveCaptionOpacity,
+    liveCaptionWidth: settings.liveCaptionWidth,
+    liveCaptionLineCount: settings.liveCaptionLineCount,
+    liveCaptionPosition: settings.liveCaptionPosition,
+    liveCaptionMinimized: settings.liveCaptionMinimized,
+    liveCaptionToggleVisible,
+    transcriptBubbles:
+      transcriptBubbles ??
+      getFloatingTranscriptBubbles(
+        state.liveSegments,
+        speakerLabelContext,
+        speakerLabels,
+      ),
+    transcriptNotice:
+      getCaptureWarning(state.live) ??
+      (isLiveTranscriptInterrupted(state.live)
+        ? getLiveTranscriptPausedMessage({
+            degraded: state.live.degraded,
+            sttProvider,
+          })
+        : null),
+  };
+}
+
+function getFloatingTitle(title: string | null | undefined) {
+  const normalized = title?.trim();
+  return normalized || "Live transcript";
+}
+
+export function getFloatingTranscriptBubbles(
+  segments: ListenerState["liveSegments"],
+  speakerLabelContext?: RenderLabelContext,
+  speakerLabels?: FloatingSpeakerLabels,
+): FloatingTranscriptBubble[] {
+  const bubbles = segments
+    .slice()
+    .sort(
+      (a, b) =>
+        a.start_ms - b.start_ms ||
+        a.end_ms - b.end_ms ||
+        a.id.localeCompare(b.id),
+    )
+    .slice(-LIVE_TRANSCRIPT_PREVIEW_SEGMENT_LIMIT)
+    .map((segment) => {
+      const text = getFloatingSegmentText(segment);
+      if (!text) {
+        return null;
+      }
+
+      // A resolved identity decides who is speaking; the channel only does so
+      // until the native labeler has answered.
+      const resolved = speakerLabels?.get(segment.id);
+      const isSelf = resolved?.humanId
+        ? resolved.humanId === speakerLabelContext?.getSelfHumanId()
+        : isFloatingSelfSpeaker(segment.key);
+      return {
+        id: segment.id,
+        speakerLabel: resolved
+          ? isSelf
+            ? "You"
+            : resolved.label
+          : getFloatingSpeakerLabel(segment.key, speakerLabelContext),
+        text,
+        isSelf,
+        isFinal: segment.words.every((word) => word.is_final),
+        startMs: segment.start_ms,
+        endMs: segment.end_ms,
+        overlapsPrevious: false,
+        overlapsNext: false,
+      };
+    })
+    .filter((bubble): bubble is FloatingTranscriptBubble => bubble !== null);
+
+  markFloatingTranscriptOverlaps(bubbles);
+  return bubbles;
+}
+
+function getFloatingSegmentText(
+  segment: ListenerState["liveSegments"][number],
+) {
+  const wordText = segment.words
+    .map((word) => word.text.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+([,.?!;:])/g, "$1");
+
+  return (wordText || segment.text).trim().replace(/\s+/g, " ");
+}
+
+function getFloatingSpeakerLabel(
+  key: ListenerState["liveSegments"][number]["key"],
+  ctx?: RenderLabelContext,
+) {
+  if (isFloatingSelfSpeaker(key)) {
+    return "You";
+  }
+
+  if (ctx) {
+    return SegmentKeyUtils.renderLabel(key, ctx);
+  }
+
+  if (key.speaker_index != null) {
+    return `Speaker ${key.speaker_index + 1}`;
+  }
+
+  if (key.channel === "RemoteParty") {
+    return "Speaker";
+  }
+
+  return "Audio";
+}
+
+function isFloatingSelfSpeaker(
+  key: ListenerState["liveSegments"][number]["key"],
+) {
+  return key.channel === "DirectMic";
+}
+
+type RankedOverlapBoundary = {
+  isSelf: boolean;
+  speakerLabel: string;
+  value: number;
+};
+
+function markFloatingTranscriptOverlaps(bubbles: FloatingTranscriptBubble[]) {
+  const latestEnds: RankedOverlapBoundary[] = [];
+  for (const bubble of bubbles) {
+    const latestOtherEnd = getOtherSpeakerBoundary(latestEnds, bubble);
+    bubble.overlapsPrevious =
+      bubble.endMs - bubble.startMs >=
+        FLOATING_TRANSCRIPT_OVERLAP_THRESHOLD_MS &&
+      latestOtherEnd !== undefined &&
+      latestOtherEnd >=
+        bubble.startMs + FLOATING_TRANSCRIPT_OVERLAP_THRESHOLD_MS;
+    updateRankedBoundaries(latestEnds, bubble, bubble.endMs, "largest");
+  }
+
+  const earliestStarts: RankedOverlapBoundary[] = [];
+  for (let index = bubbles.length - 1; index >= 0; index -= 1) {
+    const bubble = bubbles[index]!;
+    const earliestOtherStart = getOtherSpeakerBoundary(earliestStarts, bubble);
+    bubble.overlapsNext =
+      earliestOtherStart !== undefined &&
+      earliestOtherStart <=
+        bubble.endMs - FLOATING_TRANSCRIPT_OVERLAP_THRESHOLD_MS;
+
+    if (
+      bubble.endMs - bubble.startMs >=
+      FLOATING_TRANSCRIPT_OVERLAP_THRESHOLD_MS
+    ) {
+      updateRankedBoundaries(
+        earliestStarts,
+        bubble,
+        bubble.startMs,
+        "smallest",
+      );
+    }
+  }
+}
+
+function getOtherSpeakerBoundary(
+  boundaries: RankedOverlapBoundary[],
+  bubble: FloatingTranscriptBubble,
+) {
+  return boundaries.find(
+    (boundary) =>
+      boundary.isSelf !== bubble.isSelf ||
+      boundary.speakerLabel !== bubble.speakerLabel,
+  )?.value;
+}
+
+function updateRankedBoundaries(
+  boundaries: RankedOverlapBoundary[],
+  bubble: FloatingTranscriptBubble,
+  value: number,
+  ranking: "largest" | "smallest",
+) {
+  const existing = boundaries.find(
+    (boundary) =>
+      boundary.isSelf === bubble.isSelf &&
+      boundary.speakerLabel === bubble.speakerLabel,
+  );
+  const isBetter =
+    ranking === "largest"
+      ? (candidate: number, current: number) => candidate > current
+      : (candidate: number, current: number) => candidate < current;
+
+  if (existing) {
+    if (isBetter(value, existing.value)) {
+      existing.value = value;
+    }
+  } else {
+    boundaries.push({
+      isSelf: bubble.isSelf,
+      speakerLabel: bubble.speakerLabel,
+      value,
+    });
+  }
+
+  boundaries.sort((left, right) =>
+    ranking === "largest" ? right.value - left.value : left.value - right.value,
+  );
+  boundaries.splice(2);
+}
+
+function shouldShowFloatingLiveCaptionToggle({
+  liveTranscriptionActive,
+}: {
+  provider?: string | null;
+  model?: string | null;
+  liveTranscriptionActive: boolean;
+}) {
+  return liveTranscriptionActive;
+}
+
+export function getFloatingLiveCaptionToggleVisible(state: ListenerState) {
+  return shouldShowFloatingLiveCaptionToggle({
+    liveTranscriptionActive:
+      state.live.liveTranscriptionActive === true ||
+      isLiveTranscriptInterrupted(state.live),
+  });
+}
+
+export function getCurrentFloatingBarColorScheme(): FloatingBarColorScheme {
+  if (typeof document === "undefined") {
+    return "dark";
+  }
+
+  return document.documentElement.classList.contains("dark") ? "dark" : "light";
+}
+
+export function isSameFloatingRouteState(
+  left: FloatingRouteState | null,
+  right: FloatingRouteState | null,
+) {
+  return (
+    left?.sessionId === right?.sessionId &&
+    left?.amplitude === right?.amplitude &&
+    left?.status === right?.status &&
+    left?.colorScheme === right?.colorScheme &&
+    left?.opacity === right?.opacity &&
+    left?.liveCaptionOpacity === right?.liveCaptionOpacity &&
+    left?.liveCaptionWidth === right?.liveCaptionWidth &&
+    left?.liveCaptionLineCount === right?.liveCaptionLineCount &&
+    left?.liveCaptionPosition === right?.liveCaptionPosition &&
+    left?.liveCaptionMinimized === right?.liveCaptionMinimized &&
+    left?.liveCaptionToggleVisible === right?.liveCaptionToggleVisible &&
+    left?.title === right?.title &&
+    (left?.transcriptNotice ?? null) === (right?.transcriptNotice ?? null) &&
+    left?.dictation?.sessionId === right?.dictation?.sessionId &&
+    left?.dictation?.phase === right?.dictation?.phase &&
+    left?.dictation?.microphone === right?.dictation?.microphone &&
+    left?.dictation?.text === right?.dictation?.text &&
+    left?.dictation?.partial === right?.dictation?.partial &&
+    left?.dictation?.previewEnabled === right?.dictation?.previewEnabled &&
+    left?.dictation?.previewUnavailable ===
+      right?.dictation?.previewUnavailable &&
+    isSameFloatingTranscriptBubbles(
+      left?.transcriptBubbles,
+      right?.transcriptBubbles,
+    )
+  );
+}
+
+function isSameFloatingTranscriptBubbles(
+  left: FloatingTranscriptBubble[] | undefined,
+  right: FloatingTranscriptBubble[] | undefined,
+) {
+  if (left === right) {
+    return true;
+  }
+
+  if (!left || !right || left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((bubble, index) => {
+    const other = right[index];
+    return (
+      other &&
+      bubble.id === other.id &&
+      bubble.speakerLabel === other.speakerLabel &&
+      bubble.text === other.text &&
+      bubble.isSelf === other.isSelf &&
+      bubble.isFinal === other.isFinal &&
+      bubble.startMs === other.startMs &&
+      bubble.endMs === other.endMs &&
+      bubble.overlapsPrevious === other.overlapsPrevious &&
+      bubble.overlapsNext === other.overlapsNext
+    );
+  });
+}

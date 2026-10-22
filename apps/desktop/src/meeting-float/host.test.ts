@@ -1,0 +1,602 @@
+import { describe, expect, it } from "vitest";
+
+import type { LiveTranscriptSegment } from "@anlg/plugin-transcription";
+
+import {
+  getFloatingRouteState,
+  getFloatingTranscriptBubbles,
+  haveFloatingRouteInputsChanged,
+} from "./host";
+import { getFloatingLiveCaptionToggleVisible } from "./route-state";
+
+import { createListenerStore } from "~/store/zustand/listener";
+import { LIVE_TRANSCRIPT_PREVIEW_SEGMENT_LIMIT } from "~/store/zustand/listener/transcript";
+import type { RenderLabelContext } from "~/stt/live-segment";
+
+type ListenerLiveState = ReturnType<
+  ReturnType<typeof createListenerStore>["getState"]
+>["live"];
+type SegmentWord = LiveTranscriptSegment["words"][number];
+
+function createListenerState(live: Partial<ListenerLiveState>) {
+  const store = createListenerStore();
+  store.setState({
+    live: {
+      ...store.getState().live,
+      ...live,
+    },
+  });
+  return store.getState();
+}
+
+function createListenerStateWithSegments(
+  live: Partial<ListenerLiveState>,
+  liveSegments: LiveTranscriptSegment[],
+) {
+  const store = createListenerStore();
+  store.setState({
+    live: {
+      ...store.getState().live,
+      ...live,
+    },
+    liveSegments,
+  });
+  return store.getState();
+}
+
+function createSegment(
+  segment: Omit<LiveTranscriptSegment, "end_ms" | "words"> & {
+    words: Array<Partial<SegmentWord> & Pick<SegmentWord, "text">>;
+    end_ms?: number;
+  },
+): LiveTranscriptSegment {
+  return {
+    ...segment,
+    end_ms: segment.end_ms ?? segment.start_ms + 100,
+    words: segment.words.map((word, index) => ({
+      start_ms: word.start_ms ?? segment.start_ms + index * 10,
+      end_ms: word.end_ms ?? segment.start_ms + index * 10 + 5,
+      channel: word.channel ?? segment.key.channel,
+      is_final: word.is_final ?? true,
+      text: word.text,
+      id: word.id,
+    })),
+  };
+}
+
+describe("getFloatingRouteState", () => {
+  it("returns recording status for healthy live sessions", () => {
+    expect(
+      getFloatingRouteState(
+        createListenerState({
+          status: "active",
+          sessionId: "session-1",
+          amplitude: { mic: 0.6, speaker: 0.8 },
+        }),
+      ),
+    ).toEqual({
+      sessionId: "session-1",
+      title: "Live transcript",
+      amplitude: 1,
+      status: "recording",
+      colorScheme: "dark",
+      opacity: 0.78,
+      liveCaptionOpacity: 0.3,
+      liveCaptionWidth: 440,
+      liveCaptionLineCount: 1,
+      liveCaptionPosition: "topCenter",
+      liveCaptionMinimized: true,
+      liveCaptionToggleVisible: false,
+      transcriptBubbles: [],
+      transcriptNotice: null,
+    });
+  });
+
+  it("builds transcript bubbles from speaker segments", () => {
+    const segments = [
+      createSegment({
+        id: "remote-1",
+        key: {
+          channel: "RemoteParty",
+          speaker_index: 1,
+          speaker_human_id: null,
+        },
+        start_ms: 200,
+        text: "being bingo",
+        words: [{ text: "being", is_final: false }, { text: "bingo" }],
+      }),
+      createSegment({
+        id: "mic-1",
+        key: {
+          channel: "DirectMic",
+          speaker_index: null,
+          speaker_human_id: null,
+        },
+        start_ms: 100,
+        text: "summary yep",
+        words: [{ text: "summary" }, { text: "yep" }, { text: "." }],
+      }),
+    ];
+
+    expect(
+      getFloatingRouteState(
+        createListenerStateWithSegments(
+          {
+            status: "active",
+            sessionId: "session-1",
+            liveTranscriptionActive: true,
+          },
+          segments,
+        ),
+        { liveCaptionToggleVisible: true },
+      )?.transcriptBubbles,
+    ).toEqual([
+      {
+        id: "mic-1",
+        speakerLabel: "You",
+        text: "summary yep.",
+        isSelf: true,
+        isFinal: true,
+        startMs: 100,
+        endMs: 200,
+        overlapsPrevious: false,
+        overlapsNext: false,
+      },
+      {
+        id: "remote-1",
+        speakerLabel: "Speaker 2",
+        text: "being bingo",
+        isSelf: false,
+        isFinal: false,
+        startMs: 200,
+        endMs: 300,
+        overlapsPrevious: false,
+        overlapsNext: false,
+      },
+    ]);
+  });
+
+  it("marks the transcript toggle visible for cloud live transcription", () => {
+    expect(
+      getFloatingRouteState(
+        createListenerState({
+          status: "active",
+          sessionId: "session-1",
+          liveTranscriptionActive: true,
+        }),
+        {
+          liveCaptionToggleVisible: true,
+        },
+      )?.liveCaptionToggleVisible,
+    ).toBe(true);
+  });
+
+  it("shows capture failure in the floating bar while connection retries keep recording", () => {
+    const healthy = createListenerState({
+      status: "active",
+      sessionId: "session-1",
+      loadingPhase: "connecting",
+      requestedLiveTranscription: true,
+      liveTranscriptionActive: true,
+    });
+    expect(getFloatingRouteState(healthy)?.status).toBe("recording");
+    const failed = createListenerState({
+      ...healthy.live,
+      captureHealth: { mic: false, speaker: true, unavailable: false },
+    });
+    expect(getFloatingRouteState(failed)?.status).toBe("error");
+    expect(getFloatingRouteState(failed)?.transcriptNotice).toBeTruthy();
+    expect(haveFloatingRouteInputsChanged(failed, healthy)).toBe(true);
+  });
+
+  it("keeps recording status and adds a quiet notice when live transcription is interrupted", () => {
+    for (const live of [
+      { degraded: { type: "connection_timeout" as const } },
+      {
+        degraded: {
+          type: "authentication_failed" as const,
+          provider: "deepgram",
+        },
+      },
+      { liveTranscriptionActive: false },
+      { transcriptionStalled: true },
+    ]) {
+      expect(
+        getFloatingRouteState(
+          createListenerState({
+            status: "active",
+            sessionId: "session-1",
+            requestedLiveTranscription: true,
+            liveTranscriptionActive: true,
+            ...live,
+          }),
+        ),
+      ).toMatchObject({
+        status: "recording",
+        transcriptNotice: expect.stringMatching(/^Live transcript paused/),
+      });
+    }
+  });
+
+  it("does not report an interruption for batch-only sessions", () => {
+    expect(
+      getFloatingRouteState(
+        createListenerState({
+          status: "active",
+          sessionId: "session-1",
+          requestedLiveTranscription: false,
+          liveTranscriptionActive: false,
+        }),
+      )?.status,
+    ).toBe("recording");
+  });
+
+  it("hides the floating route while the session is finalizing", () => {
+    expect(
+      getFloatingRouteState(
+        createListenerState({
+          status: "finalizing",
+          sessionId: "session-1",
+        }),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("getFloatingTranscriptBubbles", () => {
+  it("keeps all transcript bubbles in chronological order", () => {
+    const bubbles = getFloatingTranscriptBubbles(
+      Array.from({ length: 8 }, (_, index) =>
+        createSegment({
+          id: `segment-${index}`,
+          key: {
+            channel: "RemoteParty",
+            speaker_index: index % 2,
+            speaker_human_id: null,
+          },
+          start_ms: index,
+          text: `segment ${index}`,
+          words: [{ text: `segment ${index}` }],
+        }),
+      ),
+    );
+
+    expect(bubbles.map((bubble) => bubble.id)).toEqual([
+      "segment-0",
+      "segment-1",
+      "segment-2",
+      "segment-3",
+      "segment-4",
+      "segment-5",
+      "segment-6",
+      "segment-7",
+    ]);
+  });
+
+  it("keeps only the recent bounded transcript window", () => {
+    const segmentCount = LIVE_TRANSCRIPT_PREVIEW_SEGMENT_LIMIT + 5;
+    const bubbles = getFloatingTranscriptBubbles(
+      Array.from({ length: segmentCount }, (_, index) =>
+        createSegment({
+          id: `segment-${index}`,
+          key: {
+            channel: "RemoteParty",
+            speaker_index: 0,
+            speaker_human_id: null,
+          },
+          start_ms: index * 100,
+          text: `segment ${index}`,
+          words: [{ text: `segment ${index}` }],
+        }),
+      ),
+    );
+
+    expect(bubbles).toHaveLength(LIVE_TRANSCRIPT_PREVIEW_SEGMENT_LIMIT);
+    expect(bubbles[0]?.id).toBe("segment-5");
+    expect(bubbles[bubbles.length - 1]?.id).toBe(`segment-${segmentCount - 1}`);
+  });
+
+  it("labels diarized direct-mic bubbles as self", () => {
+    const bubbles = getFloatingTranscriptBubbles([
+      createSegment({
+        id: "local-mic",
+        key: {
+          channel: "DirectMic",
+          speaker_index: 2,
+          speaker_human_id: null,
+        },
+        start_ms: 0,
+        text: "hello",
+        words: [{ text: "hello" }],
+      }),
+    ]);
+
+    expect(bubbles).toEqual([
+      {
+        id: "local-mic",
+        speakerLabel: "You",
+        text: "hello",
+        isSelf: true,
+        isFinal: true,
+        startMs: 0,
+        endMs: 100,
+        overlapsPrevious: false,
+        overlapsNext: false,
+      },
+    ]);
+  });
+
+  it("labels remote bubbles as the unique other participant", () => {
+    const ctx: RenderLabelContext = {
+      getSelfHumanId: () => "self",
+      getHumanName: (id) => (id === "remote" ? "Artem" : undefined),
+      getParticipantHumanIds: () => ["self", "remote"],
+    };
+    const bubbles = getFloatingTranscriptBubbles(
+      [
+        createSegment({
+          id: "remote",
+          key: {
+            channel: "RemoteParty",
+            speaker_index: 0,
+            speaker_human_id: null,
+          },
+          start_ms: 0,
+          text: "hello",
+          words: [{ text: "hello" }],
+        }),
+      ],
+      ctx,
+    );
+
+    expect(bubbles[0]?.speakerLabel).toBe("Artem");
+  });
+
+  it("prefers the resolver's identity over the channel for label and ownership", () => {
+    const ctx: RenderLabelContext = {
+      getSelfHumanId: () => "self",
+      getHumanName: () => undefined,
+      getParticipantHumanIds: () => ["self", "remote", "other"],
+    };
+    const segments = [
+      createSegment({
+        id: "mic",
+        key: { channel: "DirectMic", speaker_index: 0, speaker_human_id: null },
+        start_ms: 0,
+        text: "hello",
+        words: [{ text: "hello" }],
+      }),
+      createSegment({
+        id: "remote",
+        key: {
+          channel: "RemoteParty",
+          speaker_index: 3,
+          speaker_human_id: null,
+        },
+        start_ms: 1000,
+        text: "hi",
+        words: [{ text: "hi" }],
+      }),
+      createSegment({
+        id: "guest-on-mic",
+        key: { channel: "DirectMic", speaker_index: 1, speaker_human_id: null },
+        start_ms: 2000,
+        text: "hey",
+        words: [{ text: "hey" }],
+      }),
+      createSegment({
+        id: "unresolved",
+        key: {
+          channel: "RemoteParty",
+          speaker_index: 5,
+          speaker_human_id: null,
+        },
+        start_ms: 3000,
+        text: "yo",
+        words: [{ text: "yo" }],
+      }),
+    ];
+    const bubbles = getFloatingTranscriptBubbles(
+      segments,
+      ctx,
+      new Map([
+        ["mic", { label: "John", humanId: "self" }],
+        ["remote", { label: "Artem", humanId: "remote" }],
+        ["guest-on-mic", { label: "Artem", humanId: "remote" }],
+        ["unresolved", { label: "Speaker 2" }],
+      ]),
+    );
+
+    expect(
+      bubbles.map((bubble) => [bubble.speakerLabel, bubble.isSelf]),
+    ).toEqual([
+      ["You", true],
+      ["Artem", false],
+      ["Artem", false],
+      ["Speaker 2", false],
+    ]);
+    expect(
+      getFloatingTranscriptBubbles(segments, ctx).map(
+        (bubble) => bubble.speakerLabel,
+      ),
+    ).toEqual(["You", "Speaker 4", "You", "Speaker 6"]);
+  });
+
+  it("labels assigned direct-mic bubbles as self", () => {
+    const ctx: RenderLabelContext = {
+      getSelfHumanId: () => "self",
+      getHumanName: (id) => (id === "participant-1" ? "Artem" : undefined),
+      getParticipantHumanIds: () => ["self", "participant-1"],
+    };
+    const bubbles = getFloatingTranscriptBubbles(
+      [
+        createSegment({
+          id: "assigned-mic",
+          key: {
+            channel: "DirectMic",
+            speaker_index: 1,
+            speaker_human_id: "participant-1",
+          },
+          start_ms: 0,
+          text: "hello",
+          words: [{ text: "hello" }],
+        }),
+      ],
+      ctx,
+    );
+
+    expect(bubbles).toEqual([
+      {
+        id: "assigned-mic",
+        speakerLabel: "You",
+        text: "hello",
+        isSelf: true,
+        isFinal: true,
+        startMs: 0,
+        endMs: 100,
+        overlapsPrevious: false,
+        overlapsNext: false,
+      },
+    ]);
+  });
+
+  it("marks bubbles that overlap different speakers", () => {
+    const bubbles = getFloatingTranscriptBubbles([
+      createSegment({
+        id: "you",
+        key: {
+          channel: "DirectMic",
+          speaker_index: null,
+          speaker_human_id: null,
+        },
+        start_ms: 100,
+        end_ms: 900,
+        text: "how it changes",
+        words: [{ text: "how" }, { text: "it" }, { text: "changes" }],
+      }),
+      createSegment({
+        id: "speaker",
+        key: {
+          channel: "RemoteParty",
+          speaker_index: 0,
+          speaker_human_id: null,
+        },
+        start_ms: 500,
+        end_ms: 1100,
+        text: "ah how it changes",
+        words: [{ text: "ah" }, { text: "how" }, { text: "it" }],
+      }),
+    ]);
+
+    expect(bubbles).toMatchObject([
+      {
+        id: "you",
+        overlapsPrevious: false,
+        overlapsNext: true,
+      },
+      {
+        id: "speaker",
+        overlapsPrevious: true,
+        overlapsNext: false,
+      },
+    ]);
+  });
+
+  it("finds non-adjacent overlaps without rescanning the transcript", () => {
+    const bubbles = getFloatingTranscriptBubbles([
+      createSegment({
+        id: "long-you",
+        key: {
+          channel: "DirectMic",
+          speaker_index: null,
+          speaker_human_id: null,
+        },
+        start_ms: 0,
+        end_ms: 2000,
+        text: "long local segment",
+        words: [{ text: "long local segment" }],
+      }),
+      createSegment({
+        id: "short-you",
+        key: {
+          channel: "DirectMic",
+          speaker_index: null,
+          speaker_human_id: null,
+        },
+        start_ms: 100,
+        end_ms: 500,
+        text: "short local segment",
+        words: [{ text: "short local segment" }],
+      }),
+      createSegment({
+        id: "remote",
+        key: {
+          channel: "RemoteParty",
+          speaker_index: 0,
+          speaker_human_id: null,
+        },
+        start_ms: 1000,
+        end_ms: 1500,
+        text: "remote segment",
+        words: [{ text: "remote segment" }],
+      }),
+    ]);
+
+    expect(bubbles).toMatchObject([
+      { id: "long-you", overlapsNext: true },
+      { id: "short-you", overlapsNext: false },
+      { id: "remote", overlapsPrevious: true },
+    ]);
+  });
+});
+
+describe("floating route refresh", () => {
+  it("keeps the caption toggle while live transcription is interrupted", () => {
+    const state = createListenerState({
+      status: "active",
+      sessionId: "session-1",
+    });
+    expect(
+      getFloatingLiveCaptionToggleVisible({
+        ...state,
+        live: {
+          ...state.live,
+          requestedLiveTranscription: true,
+          liveTranscriptionActive: false,
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("refreshes when the transcription stall watchdog trips", () => {
+    const previous = createListenerState({
+      status: "active",
+      sessionId: "session-1",
+    });
+    const stalled = {
+      ...previous,
+      live: { ...previous.live, transcriptionStalled: true },
+    };
+    expect(haveFloatingRouteInputsChanged(stalled, previous)).toBe(true);
+  });
+
+  it("refreshes when retry state changes without new audio", () => {
+    const previous = createListenerState({
+      status: "active",
+      sessionId: "session-1",
+    });
+    const retrying = {
+      ...previous,
+      live: { ...previous.live, loadingPhase: "connecting" as const },
+    };
+    expect(haveFloatingRouteInputsChanged(retrying, previous)).toBe(true);
+    expect(haveFloatingRouteInputsChanged(previous, retrying)).toBe(true);
+    expect(haveFloatingRouteInputsChanged(previous, previous)).toBe(false);
+    const audioFailure = {
+      ...retrying,
+      live: { ...retrying.live, lastErrorIsAudioRelated: true },
+    };
+    expect(haveFloatingRouteInputsChanged(audioFailure, retrying)).toBe(true);
+    expect(haveFloatingRouteInputsChanged(retrying, audioFailure)).toBe(true);
+  });
+});

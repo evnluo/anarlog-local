@@ -1,0 +1,257 @@
+mod authority;
+pub use authority::{
+    E2eeCloudBatch, E2eeCloudEvent, acknowledge_e2ee_cloud_batch, configure_e2ee_cloud_authority,
+    e2ee_cloud_accepted_head, e2ee_cloud_authority_enabled, pending_e2ee_cloud_batch,
+    preserve_e2ee_cloud_conflicts, rebase_e2ee_cloud_documents, reject_e2ee_cloud_batch,
+    set_e2ee_cloud_pull_in_progress,
+};
+#[cfg(test)]
+use std::collections::HashMap;
+
+use anlg_e2ee::OpenedField;
+#[cfg(test)]
+use serde_json::{Value, json};
+#[cfg(test)]
+use sqlx::SqlitePool;
+
+mod witness;
+
+pub use witness::{
+    E2eeWitnessEvent, E2eeWitnessRepairOutcome, E2eeWitnessUpload,
+    acknowledge_e2ee_witness_uploads, acknowledge_e2ee_witness_uploads_cancellable,
+    advance_e2ee_witness_cursor, e2ee_witness_cursor, has_e2ee_local_state,
+    has_pending_e2ee_witness_repairs, has_pending_e2ee_witness_repairs_cancellable,
+    merge_e2ee_witness_events, merge_e2ee_witness_events_cancellable,
+    merge_e2ee_witness_events_with_keyring, merge_e2ee_witness_events_with_keyring_cancellable,
+    pending_e2ee_witness_uploads, pending_e2ee_witness_uploads_cancellable,
+    repair_e2ee_replica_from_witness_bounded, repair_e2ee_replica_from_witness_bounded_cancellable,
+};
+
+pub const E2EE_DOMAIN_TABLES: &[&str] = &[
+    "action_items",
+    "daily_notes",
+    "folders",
+    "humans",
+    "organizations",
+    "session_attachments",
+    "session_documents",
+    "session_participants",
+    "session_tags",
+    "sessions",
+    "synced_preferences",
+    "tags",
+    "transcripts",
+];
+
+/// SQL predicate for the `dirty` alias, shared by encryption and pending-work status.
+/// 1.4.23 rejects new tables. Keep their new rows local until the compatible
+/// reader has shipped, without stranding rows already synced by Nightly.
+pub const E2EE_DIRTY_ROW_WRITE_COMPATIBILITY_PREDICATE: &str = "(
+  dirty.table_name IN (
+    'action_items', 'humans', 'organizations', 'session_attachments',
+    'session_documents', 'session_participants', 'sessions',
+    'synced_preferences', 'transcripts'
+  ) OR EXISTS (
+    SELECT 1 FROM e2ee_local_state AS previous
+    WHERE previous.workspace_id = dirty.workspace_id
+      AND previous.table_name = dirty.table_name
+      AND previous.row_id = dirty.row_id
+  )
+)";
+
+const ROW_MANIFEST_FIELD: &str = "$row";
+const E2EE_ENCRYPT_ROW_LIMIT: i64 = 64;
+const E2EE_APPLY_ROW_LIMIT: usize = 16;
+const E2EE_APPLY_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+const E2EE_APPLY_PREFLIGHT_RECORD_LIMIT: i64 = 64;
+const E2EE_WITNESS_REPAIR_RECORD_LIMIT: i64 = 64;
+const E2EE_WITNESS_REPAIR_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+const ACTIVE_CAPTURE_MARKER_PREDICATE: &str = "
+  length(capture.id) > length('capture_lifecycle_pending:')
+  AND json_type(capture.marker_json, '$.version') IN ('integer', 'real')
+  AND json_extract(capture.marker_json, '$.version') = 1
+  AND CASE json_extract(capture.marker_json, '$.phase')
+    WHEN 'capturing' THEN 1
+    WHEN 'finalizing' THEN 0
+    ELSE CASE
+      WHEN json_extract(capture.marker_json, '$.summaryMode') IN ('regenerate', 'if_empty')
+        THEN 0
+      ELSE 1
+    END
+  END = 1
+  AND json_type(capture.marker_json, '$.sessionId') = 'text'
+  AND json_extract(capture.marker_json, '$.sessionId')
+    = substr(capture.id, length('capture_lifecycle_pending:') + 1)
+  AND json_type(capture.marker_json, '$.transcriptId') = 'text'
+  AND json_extract(capture.marker_json, '$.transcriptId') != ''
+  AND json_type(capture.marker_json, '$.startedAt') IN ('integer', 'real')
+  AND abs(json_extract(capture.marker_json, '$.startedAt')) <= 1.7976931348623157e308
+  AND json_type(capture.marker_json, '$.createdAt') = 'text'
+  AND json_type(capture.marker_json, '$.audioOffsetMs') IN ('integer', 'real')
+  AND abs(json_extract(capture.marker_json, '$.audioOffsetMs')) <= 1.7976931348623157e308
+  AND json_type(capture.marker_json, '$.preserveExistingTranscript') IN ('true', 'false')
+  AND json_type(capture.marker_json, '$.ownerUserId') = 'text'
+  AND json_type(capture.marker_json, '$.memo') = 'text'";
+
+#[derive(Debug, thiserror::Error)]
+pub enum E2eeReplicaError {
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error(transparent)]
+    Crypto(#[from] anlg_e2ee::Error),
+    #[error("encrypted replica contains an invalid table or field")]
+    InvalidField,
+    #[error("encrypted replica contains an unsupported SQLite value")]
+    UnsupportedValue,
+    #[error("encrypted replica contains an invalid row")]
+    InvalidRow,
+    #[error("encrypted replica row exceeds the apply byte limit")]
+    ReplicaApplyTooLarge,
+    #[error("encrypted witness record exceeds the repair byte limit")]
+    WitnessRepairTooLarge,
+    #[error("encrypted witness upload exceeds the batch byte limit")]
+    WitnessUploadTooLarge,
+    #[error("encrypted replica operation was cancelled")]
+    Cancelled,
+    #[error("encrypted replica rollback was detected")]
+    RollbackDetected,
+}
+
+pub type E2eeReplicaResult<T> = std::result::Result<T, E2eeReplicaError>;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct E2eeReplicaStats {
+    pub encrypted_fields: u64,
+    pub applied_fields: u64,
+    pub skipped_local_changes: u64,
+    pub incomplete_chunk_columns: u64,
+    pub rejected_rollbacks: u64,
+    pub rejected_unwitnessed: u64,
+    pub deferred_unwitnessed_rows: u64,
+    pub deferred_incomplete_snapshot_rows: u64,
+    pub parked_records: u64,
+    pub recorded_conflicts: u64,
+    pub merged_fields: u64,
+    pub repaired_witness_records: u64,
+    pub remaining_witness_repairs: bool,
+    pub remaining_replica_changes: bool,
+}
+
+#[derive(Clone, sqlx::FromRow)]
+struct LocalState {
+    record_id: String,
+    workspace_id: String,
+    table_name: String,
+    row_id: String,
+    field_name: String,
+    revision: i64,
+    writer_id: String,
+    value_tag: String,
+    payload_hash: String,
+    payload: String,
+    edited_at_ms: Option<i64>,
+    republish: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct EncryptedRecord {
+    id: String,
+    workspace_id: String,
+    payload: String,
+    witnessed: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct EncryptedRecordMetadata {
+    id: String,
+    workspace_id: String,
+    generation: i64,
+    record_bytes: i64,
+    witnessed: bool,
+    changed: bool,
+}
+
+struct DecryptedRecord {
+    record_id: String,
+    workspace_id: String,
+    payload_hash: String,
+    payload: String,
+    field: OpenedField,
+}
+
+#[derive(Clone, sqlx::FromRow)]
+struct DirtyRow {
+    workspace_id: String,
+    table_name: String,
+    row_id: String,
+    generation: i64,
+    dirtied_at_ms: i64,
+}
+
+struct PreparedEncryptedField {
+    state: LocalState,
+    previous_payload_hash: Option<String>,
+    expected_witness_version: Option<WitnessVersion>,
+}
+
+struct PreparedDirtyRow {
+    dirty: DirtyRow,
+    fields: Vec<PreparedEncryptedField>,
+    /// Plain columns now synced as chunks; their old field state is dropped.
+    retired_fields: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WitnessVersion {
+    revision: i64,
+    writer_id: String,
+    payload_hash: String,
+}
+
+mod chunks;
+mod conflicts;
+mod cooperative;
+mod library;
+mod merge;
+mod replica_apply;
+mod replica_encrypt;
+mod replica_storage;
+
+pub use conflicts::{
+    E2eeFieldConflict, list_e2ee_field_conflicts, resolve_e2ee_field_conflict,
+    restore_e2ee_field_conflict, unresolved_e2ee_field_conflict_count,
+};
+use cooperative::yield_once;
+#[cfg(test)]
+use replica_apply::apply_e2ee_replica_changes_inner;
+pub use replica_apply::{
+    E2eeReceivedApplyOptions, apply_e2ee_replica_changes, apply_e2ee_replica_changes_with_witness,
+    apply_received_e2ee_replica_changes_with_options_cancellable,
+    apply_received_e2ee_replica_changes_with_witness,
+    apply_received_e2ee_replica_changes_with_witness_cancellable,
+};
+use replica_encrypt::check_e2ee_cancellation;
+pub use replica_encrypt::{
+    encrypt_e2ee_replica_changes, encrypt_e2ee_replica_changes_bounded,
+    encrypt_e2ee_replica_changes_bounded_deferring_active_captures,
+    encrypt_e2ee_replica_changes_bounded_deferring_active_captures_cancellable,
+    encrypt_e2ee_replica_changes_deferring_active_captures,
+    encrypt_e2ee_replica_changes_deferring_active_captures_cancellable,
+    has_pending_e2ee_dirty_rows_deferring_active_captures, has_pending_e2ee_replica_changes,
+    has_pending_e2ee_replica_changes_deferring_active_captures,
+};
+#[cfg(test)]
+use replica_encrypt::{
+    load_dirty_rows, persist_prepared_dirty_row, persist_prepared_dirty_row_cancellable,
+    persist_prepared_dirty_row_inner, prepare_dirty_row,
+};
+#[cfg(test)]
+use replica_storage::load_or_create_writer_id;
+use replica_storage::reconcile_e2ee_witness_pending;
+pub use replica_storage::{
+    E2eeParkReason, E2eeParkedRecordSummary, parked_e2ee_record_summary,
+    requeue_parked_e2ee_records,
+};
+
+#[cfg(test)]
+mod tests;

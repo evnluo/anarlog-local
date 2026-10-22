@@ -1,0 +1,553 @@
+use super::*;
+use crate::{
+    RenderTranscriptInput, RenderTranscriptRequest, RenderTranscriptWordInput,
+    render_transcript_segments,
+};
+
+fn context() -> SpeakerContext {
+    SpeakerContext {
+        intervals: vec![SpeakerContextInterval {
+            start_ms: 1000,
+            end_ms: 10000,
+            active_call: true,
+            calendar_call: false,
+            mic_isolated: Some(true),
+            shared_microphone: false,
+            title: "지헌 🤝 덕행".into(),
+            self_names: vec!["지헌".into()],
+            participants: vec![],
+        }],
+    }
+}
+
+fn request(context: SpeakerContext, speakers: &[(i32, i32)]) -> RenderTranscriptRequest {
+    RenderTranscriptRequest {
+        speaker_context: Some(context),
+        preview: None,
+        participant_human_ids: vec![],
+        self_human_id: Some("self".into()),
+        humans: vec![RenderTranscriptHuman {
+            human_id: "self".into(),
+            name: "John".into(),
+        }],
+        transcripts: vec![RenderTranscriptInput {
+            started_at: Some(1000),
+            assignments: vec![],
+            words: speakers
+                .iter()
+                .enumerate()
+                .map(|(i, (channel, speaker))| RenderTranscriptWordInput {
+                    id: i.to_string(),
+                    text: format!("word{i} "),
+                    start_ms: i as i64 * 1000,
+                    end_ms: i as i64 * 1000 + 500,
+                    channel: *channel,
+                    speaker_index: Some(*speaker),
+                    synthetic_timing: None,
+                })
+                .collect(),
+        }],
+    }
+}
+
+#[test]
+fn no_attendees_call_names_self_and_title_candidate_without_creating_identities() {
+    let segments = render_transcript_segments(request(context(), &[(0, 0), (1, 1)]));
+    assert_eq!(
+        segments
+            .iter()
+            .map(|s| s.speaker_label.as_str())
+            .collect::<Vec<_>>(),
+        ["John", "덕행"]
+    );
+    assert!(segments.iter().all(|s| s.key.speaker_human_id.is_none()));
+    assert_eq!(
+        segments[1].provisional_speaker.as_ref().unwrap().human_id,
+        None
+    );
+}
+
+#[test]
+fn unknown_title_leaves_remote_numbered_from_one() {
+    let mut context = context();
+    context.intervals[0].self_names.clear();
+    let segments = render_transcript_segments(request(context, &[(0, 0), (1, 1)]));
+    assert_eq!(segments[0].speaker_label, "John");
+    assert_eq!(segments[1].speaker_label, "Speaker 1");
+}
+
+// Diarization indices restart with every stream refresh, so one invitee routinely shows up as
+// several remote voices over a long call.
+#[test]
+fn every_remote_voice_on_a_call_is_the_sole_other_invitee() {
+    let mut context = context();
+    context.intervals[0]
+        .participants
+        .push(RenderTranscriptHuman {
+            human_id: "remote".into(),
+            name: "Alex".into(),
+        });
+    let mut req = request(context, &[(1, 0), (1, 1), (1, 2)]);
+    req.participant_human_ids = vec!["remote".into()];
+    let segments = render_transcript_segments(req);
+    assert_eq!(segments.len(), 3);
+    assert!(segments.iter().all(|s| {
+        s.speaker_label == "Alex"
+            && s.key.speaker_human_id.is_none()
+            && s.provisional_speaker.as_ref().unwrap().human_id.as_deref() == Some("remote")
+    }));
+}
+
+// call-evidence changes split context intervals even while mic_isolated stays true on both
+// sides; the ranges must coalesce so a word straddling that seam still inherits the mic's
+// only named human.
+#[test]
+fn word_spanning_adjacent_isolated_intervals_keeps_the_mic_human() {
+    let mut context = context();
+    let template = context.intervals[0].clone();
+    context.intervals = vec![
+        SpeakerContextInterval {
+            start_ms: 1500,
+            end_ms: 2000,
+            ..template.clone()
+        },
+        SpeakerContextInterval {
+            start_ms: 2000,
+            end_ms: 2500,
+            ..template
+        },
+    ];
+    let mut req = request(context, &[(0, 0)]);
+    req.transcripts[0].assignments = vec![crate::IdentityAssignment {
+        human_id: "self".into(),
+        scope: crate::IdentityScope::ChannelSpeaker {
+            channel: ChannelProfile::DirectMic,
+            speaker_index: 0,
+        },
+    }];
+    req.transcripts[0].words[0].speaker_index = None;
+    req.transcripts[0].words[0].start_ms = 900;
+    req.transcripts[0].words[0].end_ms = 1100;
+    let segments = render_transcript_segments(req);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].speaker_label, "John");
+    assert_eq!(segments[0].key.speaker_human_id.as_deref(), Some("self"));
+}
+
+// Without an explicit assignment the seam check relies on the context
+// intervals alone: an index-less word straddling adjacent isolated intervals
+// still resolves to the owner rather than a number.
+#[test]
+fn word_spanning_adjacent_isolated_intervals_is_named_via_context() {
+    let mut context = context();
+    let template = context.intervals[0].clone();
+    context.intervals = vec![
+        SpeakerContextInterval {
+            start_ms: 1500,
+            end_ms: 2000,
+            ..template.clone()
+        },
+        SpeakerContextInterval {
+            start_ms: 2000,
+            end_ms: 2500,
+            ..template
+        },
+    ];
+    let mut req = request(context, &[(0, 0)]);
+    req.transcripts[0].words[0].speaker_index = None;
+    req.transcripts[0].words[0].start_ms = 900;
+    req.transcripts[0].words[0].end_ms = 1100;
+    let segments = render_transcript_segments(req);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].speaker_label, "John");
+    assert_eq!(segments[0].key.speaker_human_id.as_deref(), Some("self"));
+}
+
+// A guest's speaker-scoped mic assignment must not stick to index-less words
+// recorded inside a verified isolated interval — the owner is the only voice
+// there, matching what the live engine emits.
+#[test]
+fn isolated_indexless_word_beats_scoped_guest_assignment() {
+    let mut req = request(context(), &[(0, 0)]);
+    req.transcripts[0].assignments = vec![crate::IdentityAssignment {
+        human_id: "guest".into(),
+        scope: crate::IdentityScope::ChannelSpeaker {
+            channel: ChannelProfile::DirectMic,
+            speaker_index: 0,
+        },
+    }];
+    req.transcripts[0].words[0].speaker_index = None;
+    let segments = render_transcript_segments(req);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].speaker_label, "John");
+    assert_eq!(segments[0].key.speaker_human_id.as_deref(), Some("self"));
+}
+
+// A shared microphone stays anonymous even inside an isolated interval:
+// `resolve_speaker` refuses self-labeling there, so the range fallback must
+// honor the same guard.
+#[test]
+fn shared_microphone_interval_never_inherits_the_owner() {
+    let mut context = context();
+    context.intervals[0].shared_microphone = true;
+    let mut req = request(context, &[(0, 0)]);
+    req.transcripts[0].words[0].speaker_index = None;
+    let segments = render_transcript_segments(req);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].key.speaker_human_id, None);
+    assert_eq!(segments[0].speaker_label, "Speaker 1");
+}
+
+#[test]
+fn several_remote_voices_stay_anonymous_when_several_people_were_invited() {
+    let mut context = context();
+    for (id, name) in [("a", "Alex"), ("b", "Bob")] {
+        context.intervals[0]
+            .participants
+            .push(RenderTranscriptHuman {
+                human_id: id.into(),
+                name: name.into(),
+            });
+    }
+    let segments = render_transcript_segments(request(context, &[(1, 0), (1, 1), (1, 2)]));
+    assert_eq!(
+        segments
+            .iter()
+            .map(|s| s.speaker_label.as_str())
+            .collect::<Vec<_>>(),
+        ["Speaker 1", "Speaker 2", "Speaker 3"]
+    );
+    assert!(segments.iter().all(|s| s.provisional_speaker.is_none()));
+}
+
+#[test]
+fn one_on_one_title_names_every_remote_voice() {
+    let segments = render_transcript_segments(request(context(), &[(1, 3), (1, 5)]));
+    assert!(segments.iter().all(|s| s.speaker_label == "덕행"));
+}
+
+#[test]
+fn sole_remote_participant_wins_over_title() {
+    let mut context = context();
+    context.intervals[0]
+        .participants
+        .push(RenderTranscriptHuman {
+            human_id: "remote".into(),
+            name: "Alex".into(),
+        });
+    let segments = render_transcript_segments(request(context, &[(1, 8)]));
+    assert_eq!(segments[0].speaker_label, "Alex");
+    assert_eq!(
+        segments[0].provisional_speaker.as_ref().unwrap().reason,
+        SpeakerResolutionReason::SoleRemoteParticipant
+    );
+}
+
+#[test]
+fn shared_microphone_remains_anonymous() {
+    let mut shared = context();
+    shared.intervals[0].shared_microphone = true;
+    assert_eq!(
+        render_transcript_segments(request(shared, &[(0, 0)]))[0].speaker_label,
+        "Speaker 1"
+    );
+}
+
+#[test]
+fn headset_hears_only_its_wearer_however_diarization_splits_the_voice() {
+    let segments = render_transcript_segments(request(context(), &[(0, 0), (0, 1)]));
+    assert_eq!(segments.len(), 2);
+    assert!(segments.iter().all(|s| {
+        s.speaker_label == "John"
+            && s.provisional_speaker.as_ref().unwrap().reason
+                == SpeakerResolutionReason::PersonalMicrophone
+    }));
+}
+
+#[test]
+fn room_microphone_on_a_call_needs_a_single_local_voice() {
+    let mut context = context();
+    context.intervals[0].mic_isolated = Some(false);
+    let segments = render_transcript_segments(request(context.clone(), &[(0, 0)]));
+    assert_eq!(segments[0].speaker_label, "John");
+    assert_eq!(
+        segments[0].provisional_speaker.as_ref().unwrap().reason,
+        SpeakerResolutionReason::VirtualMeetingMicrophone
+    );
+    let segments = render_transcript_segments(request(context, &[(0, 0), (0, 1)]));
+    assert!(segments.iter().all(|s| s.provisional_speaker.is_none()));
+}
+
+#[test]
+fn room_microphone_on_a_call_names_only_the_dominant_local_voice() {
+    let mut context = context();
+    context.intervals[0].mic_isolated = Some(false);
+    context.intervals[0].end_ms = 20000;
+    let segments = render_transcript_segments(request(
+        context.clone(),
+        &[(0, 0), (0, 0), (0, 0), (0, 1), (0, 0)],
+    ));
+    for segment in &segments {
+        let expected = if segment.key.speaker_index == Some(0) {
+            "John"
+        } else {
+            "Speaker 1"
+        };
+        assert_eq!(segment.speaker_label, expected);
+    }
+    let segments =
+        render_transcript_segments(request(context.clone(), &[(0, 0), (0, 0), (0, 0), (0, 1)]));
+    assert!(segments.iter().all(|s| s.provisional_speaker.is_none()));
+    let mut req = request(context, &[(0, 0), (0, 0), (0, 0), (0, 0), (0, 1)]);
+    for word in &mut req.transcripts[0].words[..4] {
+        word.speaker_index = None;
+    }
+    let segments = render_transcript_segments(req);
+    assert!(segments.iter().all(|s| s.provisional_speaker.is_none()));
+}
+
+#[test]
+fn mixed_audio_and_missing_observations_never_use_current_devices() {
+    assert!(
+        render_transcript_segments(request(context(), &[(2, 0), (2, 1)]))
+            .iter()
+            .all(|s| s.provisional_speaker.is_none())
+    );
+    assert_eq!(
+        render_transcript_segments(request(SpeakerContext::default(), &[(0, 0)]))[0].speaker_label,
+        "Speaker 1"
+    );
+}
+
+#[test]
+fn room_capture_without_active_call_stays_unknown() {
+    let mut context = context();
+    context.intervals[0].active_call = false;
+    context.intervals[0].mic_isolated = Some(false);
+    assert_eq!(
+        render_transcript_segments(request(context, &[(0, 0)]))[0].speaker_label,
+        "Speaker 1"
+    );
+}
+
+#[test]
+fn changing_devices_splits_the_interval_without_renaming_earlier_words() {
+    let mut context = context();
+    context.intervals[0].end_ms = 2000;
+    let mut next = context.intervals[0].clone();
+    next.start_ms = 2000;
+    next.end_ms = 10000;
+    next.shared_microphone = true;
+    context.intervals.push(next);
+    let segments = render_transcript_segments(request(context, &[(0, 0), (0, 0)]));
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0].speaker_label, "John");
+    assert_eq!(segments[1].speaker_label, "Speaker 1");
+}
+
+#[test]
+fn expired_or_conflicting_observations_fail_closed() {
+    let mut context = context();
+    context.intervals.push(context.intervals[0].clone());
+    assert!(
+        render_transcript_segments(request(context, &[(0, 0)]))[0]
+            .provisional_speaker
+            .is_none()
+    );
+    let mut context = super::tests::context();
+    context.intervals[0].end_ms = 1100;
+    assert!(
+        render_transcript_segments(request(context, &[(0, 0)]))[0]
+            .provisional_speaker
+            .is_none()
+    );
+}
+
+#[test]
+fn explicit_correction_survives_serialization_and_diarization_changes() {
+    let mut req = request(context(), &[(0, 7)]);
+    req.humans.push(RenderTranscriptHuman {
+        human_id: "corrected".into(),
+        name: "Alex".into(),
+    });
+    req.transcripts[0]
+        .assignments
+        .push(crate::IdentityAssignment {
+            human_id: "corrected".into(),
+            scope: crate::IdentityScope::Words {
+                word_ids: vec!["0".into()],
+            },
+        });
+    let json = serde_json::to_string(&req).unwrap();
+    let mut restored: RenderTranscriptRequest = serde_json::from_str(&json).unwrap();
+    restored.transcripts[0].words[0].speaker_index = Some(42);
+    let segments = render_transcript_segments(restored);
+    assert_eq!(segments[0].speaker_label, "Alex");
+    assert!(segments[0].provisional_speaker.is_none());
+}
+
+#[test]
+fn title_candidates_require_exact_known_self_and_two_names() {
+    for title in [
+        "John x Alex",
+        "[John 🤝 Alex]",
+        "John / Alex",
+        "(Alex × John)",
+        "John <> Alex",
+        "[John] [Alex]",
+        "(John)(Alex)",
+    ] {
+        assert_eq!(
+            remote_name_from_title(title, &["John".into()]),
+            Some("Alex".into())
+        );
+    }
+    assert_eq!(
+        remote_name_from_title("덕행 지헌", &["지헌".into()]),
+        Some("덕행".into())
+    );
+    for title in [
+        "Product planning",
+        "John x Alex x Sam",
+        "John x John",
+        "[Interview]",
+        "덕행 지헌",
+    ] {
+        assert_eq!(remote_name_from_title(title, &["John".into()]), None);
+    }
+}
+
+#[test]
+fn channel_defaults_do_not_override_specific_corrections() {
+    let mut req = request(context(), &[(0, 0), (0, 1), (0, 2)]);
+    for id in ["channel", "speaker", "word"] {
+        req.humans.push(RenderTranscriptHuman {
+            human_id: id.into(),
+            name: id.into(),
+        });
+    }
+    req.transcripts[0].assignments = vec![
+        crate::IdentityAssignment {
+            human_id: "channel".into(),
+            scope: crate::IdentityScope::Channel {
+                channel: ChannelProfile::DirectMic,
+            },
+        },
+        crate::IdentityAssignment {
+            human_id: "speaker".into(),
+            scope: crate::IdentityScope::ChannelSpeaker {
+                channel: ChannelProfile::DirectMic,
+                speaker_index: 1,
+            },
+        },
+        crate::IdentityAssignment {
+            human_id: "word".into(),
+            scope: crate::IdentityScope::Words {
+                word_ids: vec!["2".into()],
+            },
+        },
+    ];
+    let segments = render_transcript_segments(req);
+    assert_eq!(
+        segments
+            .iter()
+            .map(|s| s.speaker_label.as_str())
+            .collect::<Vec<_>>(),
+        ["channel", "speaker", "word"]
+    );
+    assert!(segments.iter().all(|s| s.provisional_speaker.is_none()));
+}
+
+// A live segment carrying the self identity must not surface a raw UUID when
+// the human row is unnamed (signed-out or local profiles keep `humans` empty).
+#[test]
+fn preview_names_unnamed_self_as_you() {
+    let mut req = request(context(), &[]);
+    req.humans.clear();
+    req.preview = Some(vec![RenderedTranscriptSegment {
+        provisional_speaker: None,
+        id: "seg".into(),
+        key: crate::SegmentKey {
+            channel: ChannelProfile::DirectMic,
+            speaker_index: None,
+            speaker_human_id: Some("self".into()),
+        },
+        speaker_label: String::new(),
+        start_ms: 0,
+        end_ms: 500,
+        text: "hello".into(),
+        words: vec![crate::SegmentWord {
+            text: "hello ".into(),
+            start_ms: 0,
+            end_ms: 500,
+            channel: ChannelProfile::DirectMic,
+            is_final: true,
+            id: None,
+        }],
+    }]);
+    let segments = render_transcript_segments(req);
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].speaker_label, "You");
+}
+
+#[test]
+fn live_preview_and_saved_render_resolve_the_same_names() {
+    let req = request(context(), &[(0, 0), (1, 1)]);
+    let saved = render_transcript_segments(req.clone());
+    let mut preview = req;
+    preview.preview = Some(saved.clone());
+    for transcript in &mut preview.transcripts {
+        transcript.words.clear();
+        transcript.assignments.clear();
+    }
+    let live = render_transcript_segments(preview);
+    assert_eq!(
+        serde_json::to_value(saved).unwrap(),
+        serde_json::to_value(live).unwrap()
+    );
+}
+
+#[test]
+fn assigned_speakers_stay_merged_across_context_intervals() {
+    let mut context = context();
+    context.intervals[0].end_ms = 2000;
+    let mut next = context.intervals[0].clone();
+    next.start_ms = 3000;
+    next.end_ms = 6000;
+    next.shared_microphone = true;
+    context.intervals.push(next);
+    let mut req = request(context, &[(1, 1), (1, 2), (1, 1), (1, 3), (1, 2)]);
+    req.transcripts[0].assignments = [1, 2]
+        .into_iter()
+        .map(|speaker_index| crate::IdentityAssignment {
+            human_id: "self".into(),
+            scope: crate::IdentityScope::ChannelSpeaker {
+                channel: ChannelProfile::RemoteParty,
+                speaker_index,
+            },
+        })
+        .collect();
+
+    let saved = render_transcript_segments(req.clone());
+    assert_eq!(saved.len(), 3);
+    assert_eq!(saved[0].speaker_label, "John");
+    assert_eq!(
+        saved[0]
+            .words
+            .iter()
+            .map(|w| w.id.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("0"), Some("1"), Some("2")]
+    );
+    assert_eq!((saved[0].start_ms, saved[0].end_ms), (0, 2500));
+    assert!(saved[0].provisional_speaker.is_none());
+    assert!(saved[1].key.speaker_human_id.is_none());
+    assert_eq!(saved[2].speaker_label, "John");
+
+    req.preview = Some(saved.clone());
+    let preview = render_transcript_segments(req);
+    assert_eq!(
+        serde_json::to_value(saved).unwrap(),
+        serde_json::to_value(preview).unwrap()
+    );
+}

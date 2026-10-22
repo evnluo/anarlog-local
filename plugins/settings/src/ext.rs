@@ -1,0 +1,75 @@
+use std::path::PathBuf;
+
+use camino::Utf8PathBuf;
+
+pub struct Settings<'a, R: tauri::Runtime, M: tauri::Manager<R>> {
+    manager: &'a M,
+    _runtime: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<'a, R: tauri::Runtime, M: tauri::Manager<R>> Settings<'a, R, M> {
+    fn settings_base_path(&self) -> Result<PathBuf, crate::Error> {
+        let bundle_id: &str = self.manager.config().identifier.as_ref();
+        let path = anlg_storage::global::compute_default_base(bundle_id)
+            .ok_or(anlg_storage::Error::DataDirUnavailable)?;
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
+    pub fn settings_base(&self) -> Result<Utf8PathBuf, crate::Error> {
+        let path = self.settings_base_path()?;
+        Utf8PathBuf::from_path_buf(path).map_err(|_| anlg_storage::Error::PathNotValidUtf8.into())
+    }
+
+    pub fn global_base(&self) -> Result<Utf8PathBuf, crate::Error> {
+        self.settings_base()
+    }
+
+    pub fn settings_path(&self) -> Result<Utf8PathBuf, crate::Error> {
+        let base = self.vault_base()?;
+        Ok(base.join(anlg_storage::vault::SETTINGS_FILENAME))
+    }
+
+    pub fn vault_base(&self) -> Result<Utf8PathBuf, crate::Error> {
+        let snapshot = self.manager.state::<crate::state::StartupSnapshot>();
+        Utf8PathBuf::from_path_buf(snapshot.startup_vault_base().clone())
+            .map_err(|_| anlg_storage::Error::PathNotValidUtf8.into())
+    }
+
+    pub fn resolve_startup_vault_base(&self) -> Result<PathBuf, crate::Error> {
+        self.settings_base_path()
+    }
+
+    pub async fn load(&self) -> crate::Result<serde_json::Value> {
+        let snapshot = self.manager.state::<crate::state::StartupSnapshot>();
+        snapshot.load().await
+    }
+
+    pub async fn save(&self, settings: serde_json::Value) -> crate::Result<()> {
+        let snapshot = self.manager.state::<crate::state::StartupSnapshot>();
+        snapshot.save(settings).await
+    }
+
+    pub fn reset(&self) -> crate::Result<()> {
+        let snapshot = self.manager.state::<crate::state::StartupSnapshot>();
+        snapshot.reset()
+    }
+}
+
+pub trait SettingsPluginExt<R: tauri::Runtime> {
+    fn settings(&self) -> Settings<'_, R, Self>
+    where
+        Self: tauri::Manager<R> + Sized;
+}
+
+impl<R: tauri::Runtime, T: tauri::Manager<R>> SettingsPluginExt<R> for T {
+    fn settings(&self) -> Settings<'_, R, Self>
+    where
+        Self: Sized,
+    {
+        Settings {
+            manager: self,
+            _runtime: std::marker::PhantomData,
+        }
+    }
+}

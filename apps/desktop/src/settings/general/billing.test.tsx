@@ -1,0 +1,417 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  analyticsEvent: vi.fn(() => Promise.resolve()),
+  analyticsSetProperties: vi.fn(() => Promise.resolve()),
+  openUrl: vi.fn(() => Promise.resolve()),
+  openNew: vi.fn(),
+  signIn: vi.fn(() => Promise.resolve()),
+  signOut: vi.fn(() => Promise.resolve()),
+  buildWebAppUrl: vi.fn((path: string) =>
+    Promise.resolve(`https://anarlog.so${path}`),
+  ),
+  billing: {
+    canStartTrial: { data: false, isPending: false },
+    hasPaymentMethod: false,
+    isPaid: false,
+    isTrialing: false,
+    isPaused: false,
+    isPro: false,
+    plan: "free",
+    trialDaysRemaining: null as number | null,
+    trialEnd: null as Date | null,
+    currentPeriodEnd: null as Date | null,
+    cancelAtPeriodEnd: false,
+  } as {
+    canStartTrial: { data: boolean; isPending: boolean };
+    hasPaymentMethod: boolean;
+    isPaid: boolean;
+    isTrialing: boolean;
+    isPaused: boolean;
+    isPro?: boolean;
+    plan: string;
+    trialDaysRemaining: number | null;
+    trialEnd?: Date | null;
+    currentPeriodEnd?: Date | null;
+    cancelAtPeriodEnd?: boolean;
+  },
+  session: { user: { id: "user-1", email: "john@example.com" } } as {
+    user: { id: string; email: string };
+    access_token?: string;
+  } | null,
+  workspaces: {
+    data: [] as Array<{ workspaceId: string; name?: string }>,
+    isPending: false,
+  },
+  getWorkspaceAccess: vi.fn(),
+  requestSyncDevices: vi.fn(),
+}));
+
+vi.mock("@anlg/plugin-analytics", () => ({
+  commands: {
+    event: mocks.analyticsEvent,
+    setProperties: mocks.analyticsSetProperties,
+  },
+}));
+
+vi.mock("@anlg/plugin-opener2", () => ({
+  commands: { openUrl: mocks.openUrl },
+}));
+
+vi.mock("@anlg/plugin-windows", () => ({
+  openUrlWithInstruction: vi.fn(),
+}));
+
+vi.mock("~/auth", () => ({
+  useAuth: () => ({
+    isRefreshingSession: false,
+    refreshSession: vi.fn(),
+    session: mocks.session,
+    supabase: {},
+    signIn: mocks.signIn,
+    signOut: mocks.signOut,
+  }),
+}));
+
+vi.mock("~/settings/team/client", () => ({
+  getWorkspaceAccess: mocks.getWorkspaceAccess,
+  requireTeamContext: (auth: unknown) => auth,
+}));
+
+vi.mock("~/settings/team/mirror", () => ({
+  useMyWorkspacesWithMirror: () => mocks.workspaces,
+}));
+
+vi.mock("~/auth/billing-context", () => ({
+  useBillingAccess: () => mocks.billing,
+}));
+
+vi.mock("~/auth/sync-devices", () => ({
+  requestSyncDevices: mocks.requestSyncDevices,
+}));
+
+vi.mock("~/shared/utils", () => ({
+  buildWebAppUrl: mocks.buildWebAppUrl,
+}));
+
+vi.mock("~/store/zustand/tabs", () => ({
+  useTabs: (select: (state: unknown) => unknown) =>
+    select({ openNew: mocks.openNew }),
+}));
+
+import { SettingsBilling } from "./billing";
+
+const renderBilling = () => {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      mutations: { retry: false },
+      queries: { retry: false },
+    },
+  });
+
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <SettingsBilling />
+    </QueryClientProvider>,
+  );
+};
+
+describe("SettingsBilling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.session = { user: { id: "user-1", email: "john@example.com" } };
+    mocks.workspaces.data = [];
+    mocks.workspaces.isPending = false;
+    mocks.getWorkspaceAccess.mockResolvedValue({
+      tier: "free",
+      capabilities: [],
+    });
+    mocks.billing = {
+      canStartTrial: { data: false, isPending: false },
+      hasPaymentMethod: false,
+      isPaid: false,
+      isTrialing: false,
+      isPaused: false,
+      plan: "free",
+      trialDaysRemaining: null,
+    };
+    mocks.requestSyncDevices.mockResolvedValue({
+      devices: [],
+      pendingDevices: [],
+      maxDevices: 3,
+    });
+    globalThis.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    } as typeof ResizeObserver;
+  });
+
+  afterEach(cleanup);
+
+  it.each([
+    { personalState: "trialing", isTrialing: true, isPaused: false },
+    { personalState: "paused", isTrialing: false, isPaused: true },
+  ])(
+    "shows workspace Pro as current without the $personalState Pro status",
+    async ({ isTrialing, isPaused }) => {
+      mocks.billing = {
+        canStartTrial: { data: false, isPending: false },
+        hasPaymentMethod: true,
+        isPaid: true,
+        isTrialing,
+        isPaused,
+        plan: "pro",
+        trialDaysRemaining: 3,
+      };
+      mocks.workspaces.data = [
+        { workspaceId: "00000000-0000-4000-8000-000000000001" },
+      ];
+      mocks.getWorkspaceAccess.mockResolvedValue({
+        tier: "team",
+        capabilities: ["team.shared_notes"],
+        seatLimit: 5,
+        usedSeats: 2,
+      });
+
+      renderBilling();
+
+      expect(
+        await screen.findByText(/You're on the .*Pro.* plan/),
+      ).toBeTruthy();
+      expect(screen.queryByText("Your Pro trial has ended")).toBeNull();
+      expect(screen.queryByText("Trial")).toBeNull();
+      expect(screen.queryByText("Pro trial")).toBeNull();
+      expect(screen.queryByText("3 days left")).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: "Manage billing" }),
+      ).toBeNull();
+      expect(screen.getAllByText("Current")).toHaveLength(1);
+      expect(await screen.findByText("2 of 5 used")).toBeTruthy();
+    },
+  );
+
+  it("offers to add a payment method during a cardless trial", async () => {
+    mocks.billing = {
+      canStartTrial: { data: false, isPending: false },
+      hasPaymentMethod: false,
+      isPaid: true,
+      isTrialing: true,
+      isPaused: false,
+      plan: "trial",
+      trialDaysRemaining: 3,
+    };
+
+    renderBilling();
+
+    expect(screen.queryByText("Cancel")).toBeNull();
+
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Add payment method" })[0],
+    );
+
+    await waitFor(() =>
+      expect(mocks.buildWebAppUrl).toHaveBeenCalledWith("/app/portal", {
+        intent: "payment_method_update",
+      }),
+    );
+    expect(mocks.analyticsEvent).toHaveBeenCalledWith({
+      event: "trial_payment_method_clicked",
+      days_remaining: 3,
+      source: "settings",
+    });
+  });
+
+  it("offers to resume a paused cardless trial", async () => {
+    mocks.billing = {
+      canStartTrial: { data: false, isPending: false },
+      hasPaymentMethod: false,
+      isPaid: false,
+      isTrialing: false,
+      isPaused: true,
+      plan: "free",
+      trialDaysRemaining: 0,
+    };
+
+    renderBilling();
+
+    expect(screen.getByText("Your Pro trial has ended")).toBeTruthy();
+    fireEvent.click(screen.getAllByRole("button", { name: "Resume" })[0]);
+
+    await waitFor(() =>
+      expect(mocks.buildWebAppUrl).toHaveBeenCalledWith("/app/portal"),
+    );
+  });
+
+  it("starts a cardless trial from the behavioral action variant", async () => {
+    mocks.billing = {
+      canStartTrial: { data: true, isPending: false },
+      hasPaymentMethod: false,
+      isPaid: false,
+      isTrialing: false,
+      isPaused: false,
+      plan: "free",
+      trialDaysRemaining: null,
+    };
+
+    renderBilling();
+
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Start free trial" })[0],
+    );
+
+    await waitFor(() =>
+      expect(mocks.buildWebAppUrl).toHaveBeenCalledWith("/app/checkout", {
+        period: "monthly",
+        trial: "true",
+        source: "settings",
+      }),
+    );
+    expect(mocks.analyticsEvent).toHaveBeenCalledWith({
+      event: "trial_checkout_started",
+      plan: "pro",
+      period: "monthly",
+      source: "settings",
+    });
+  });
+
+  it("opens checkout for an upgrade when no trial is available", async () => {
+    renderBilling();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Get Pro" })[0]);
+
+    await waitFor(() =>
+      expect(mocks.buildWebAppUrl).toHaveBeenCalledWith("/app/checkout", {
+        plan: "pro",
+        period: "monthly",
+        source: "settings",
+      }),
+    );
+    expect(mocks.analyticsEvent).toHaveBeenCalledWith({
+      event: "upgrade_clicked",
+      plan: "pro",
+      period: "monthly",
+      source: "settings",
+    });
+  });
+
+  it("opens the Enterprise page from Talk to sales", async () => {
+    renderBilling();
+
+    fireEvent.click(screen.getByRole("button", { name: "Talk to sales" }));
+
+    await waitFor(() =>
+      expect(mocks.openUrl).toHaveBeenCalledWith(
+        "https://anarlog.so/enterprise/",
+        null,
+      ),
+    );
+  });
+
+  it("asks guests to sign in instead of opening checkout", async () => {
+    mocks.session = null;
+
+    renderBilling();
+
+    expect(screen.queryByRole("button", { name: "Get Pro" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Sign in for Pro" }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in to Anarlog" }));
+
+    expect(mocks.openNew).toHaveBeenCalledWith({
+      type: "settings",
+      state: { tab: "account" },
+    });
+    expect(mocks.buildWebAppUrl).not.toHaveBeenCalledWith(
+      "/app/checkout",
+      expect.anything(),
+    );
+  });
+
+  it("renders the current plan as status once the trial has a payment method", () => {
+    mocks.billing = {
+      canStartTrial: { data: false, isPending: false },
+      hasPaymentMethod: true,
+      isPaid: true,
+      isTrialing: true,
+      isPaused: false,
+      plan: "trial",
+      trialDaysRemaining: 3,
+    };
+
+    renderBilling();
+
+    expect(
+      screen.queryByRole("button", { name: "Add payment method" }),
+    ).toBeNull();
+    expect(screen.getByText("Current")).toBeTruthy();
+    expect(screen.queryByText("Cancel")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Current/ })).toBeNull();
+  });
+
+  it("preserves existing trial days beyond the new trial duration in plan limits", async () => {
+    mocks.billing = {
+      canStartTrial: { data: false, isPending: false },
+      hasPaymentMethod: true,
+      isPaid: true,
+      isTrialing: true,
+      isPaused: false,
+      plan: "trial",
+      trialDaysRemaining: 18,
+      trialEnd: new Date("2025-10-01T00:00:00Z"),
+    };
+
+    renderBilling();
+
+    expect(await screen.findByText("Plan limits")).toBeTruthy();
+    expect(screen.getByText("Pro trial")).toBeTruthy();
+    expect(screen.getByText("18 days left")).toBeTruthy();
+    expect(screen.getByText("Ends Oct 1, 2025")).toBeTruthy();
+  });
+
+  it("shows synced device usage for Pro users", async () => {
+    mocks.session = {
+      user: { id: "user-1", email: "john@example.com" },
+      access_token: "token-1",
+    };
+    mocks.billing = {
+      canStartTrial: { data: false, isPending: false },
+      hasPaymentMethod: true,
+      isPaid: true,
+      isPro: true,
+      isTrialing: false,
+      isPaused: false,
+      plan: "pro",
+      trialDaysRemaining: null,
+      currentPeriodEnd: new Date("2025-10-15T00:00:00Z"),
+    };
+    mocks.requestSyncDevices.mockResolvedValue({
+      devices: [{ deviceFingerprint: "device-a" }],
+      pendingDevices: [{ deviceFingerprint: "device-b" }],
+      maxDevices: 3,
+    });
+
+    renderBilling();
+
+    expect(await screen.findByText("Synced devices")).toBeTruthy();
+    expect(screen.getByText("2 of 3 used")).toBeTruthy();
+    expect(screen.getByText(/renews Oct 15, 2025/)).toBeTruthy();
+    expect(
+      screen.getAllByRole("button", { name: "Manage billing" }),
+    ).toHaveLength(1);
+    expect(mocks.requestSyncDevices).toHaveBeenCalledWith(
+      "token-1",
+      expect.anything(),
+    );
+  });
+});

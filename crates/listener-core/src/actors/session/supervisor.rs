@@ -1,0 +1,1212 @@
+mod children;
+mod mode;
+#[cfg(test)]
+mod reliability_tests;
+
+use std::hash::{DefaultHasher, Hash, Hasher};
+
+use ractor::concurrency::Duration;
+use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, SupervisionEvent};
+use tracing::Instrument;
+
+use crate::DegradedError;
+use crate::actors::session::types::{
+    SessionConfigUpdate, SessionContext, SessionParams, session_span, session_supervisor_name,
+};
+use crate::actors::{ListenerConfigUpdate, ListenerInitError, ListenerMsg};
+
+use self::children::ChildKind;
+use self::mode::SessionModeState;
+
+const LISTENER_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+];
+const MAX_LISTENER_RETRY_AFTER: Duration = Duration::from_secs(30);
+const RECORDER_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+pub struct SessionState {
+    ctx: SessionContext,
+    source_cell: Option<ActorCell>,
+    listener_cell: Option<ActorCell>,
+    recorder_cell: Option<ActorCell>,
+    source_restarts: anlg_supervisor::RestartTracker,
+    recorder_restarts: anlg_supervisor::RestartTracker,
+    mode: SessionModeState,
+    listener_retry_attempt: usize,
+    listener_mic_isolated: bool,
+    shutting_down: bool,
+}
+
+pub struct SessionActor;
+
+pub enum SessionMsg {
+    Shutdown,
+    RetryListener,
+    RetryRecorder,
+    SourceHealthy,
+    SourceRoutingChanged,
+    UpdateCredentials(String),
+    UpdateConfig(SessionConfigUpdate),
+}
+
+#[ractor::async_trait]
+impl Actor for SessionActor {
+    type Msg = SessionMsg;
+    type State = SessionState;
+    type Arguments = SessionContext;
+
+    async fn pre_start(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        ctx: Self::Arguments,
+    ) -> Result<Self::State, ActorProcessingErr> {
+        let session_id = ctx.params.session_id.clone();
+        let span = session_span(&session_id);
+
+        async {
+            let mode = SessionModeState::new(
+                ctx.requested_transcription_mode,
+                ctx.params.transcription_mode,
+            );
+            let recorder_cell = match children::spawn_recorder(myself.get_cell(), &ctx).await {
+                Ok(cell) => Some(cell),
+                Err(error) => {
+                    emit_storage_error(&ctx, &error.to_string());
+                    myself.send_after(RECORDER_RETRY_DELAY, || SessionMsg::RetryRecorder);
+                    None
+                }
+            };
+            let source_ref = children::spawn_source(
+                myself.get_cell(),
+                &ctx,
+                recorder_cell.as_ref().cloned(),
+                mode.listener_routing(None),
+            )
+            .await
+            .map_err(|e| -> ActorProcessingErr { Box::new(e) })?;
+
+            Ok(SessionState {
+                ctx,
+                source_cell: Some(source_ref.get_cell()),
+                listener_cell: None,
+                recorder_cell,
+                source_restarts: anlg_supervisor::RestartTracker::new(),
+                recorder_restarts: anlg_supervisor::RestartTracker::new(),
+                mode,
+                listener_retry_attempt: 0,
+                listener_mic_isolated: false,
+                shutting_down: false,
+            })
+        }
+        .instrument(span)
+        .await
+    }
+
+    // Listener is spawned in post_start so that a connection failure enters
+    // batch fallback instead of killing the session -- source and recorder keep running.
+    async fn post_start(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        let span = session_span(&state.ctx.params.session_id);
+
+        async {
+            if !state.mode.should_spawn_listener() {
+                return Ok(());
+            }
+
+            match children::spawn_listener(myself.get_cell(), &state.ctx, None).await {
+                Ok((listener_cell, mic_isolated)) => {
+                    state.listener_cell = Some(listener_cell);
+                    state.listener_mic_isolated = mic_isolated;
+                    state.mode.on_listener_attached();
+                    children::attach_listener_to_source(state).await;
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "listener_spawn_failed");
+                    let retry_after = listener_retry_after(&error);
+                    let degraded = classify_listener_spawn_failure(state, &error);
+                    handle_listener_failure(&myself, state, degraded, retry_after).await;
+                }
+            }
+
+            Ok(())
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn handle(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        message: Self::Msg,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
+            SessionMsg::SourceHealthy => state.source_restarts.reset(),
+            SessionMsg::SourceRoutingChanged => {
+                refresh_listener_on_isolation_change(&myself, state).await;
+            }
+            SessionMsg::Shutdown => {
+                state.shutting_down = true;
+                children::shutdown_children(state, "session_stop").await;
+                myself.stop(None);
+            }
+            SessionMsg::UpdateCredentials(api_key) => {
+                if !api_key.is_empty() && api_key != state.ctx.params.api_key {
+                    state.ctx.params.api_key = api_key;
+                    if state.listener_cell.is_none() && !state.shutting_down {
+                        state.listener_retry_attempt = 0;
+                        retry_listener(myself, state).await;
+                    }
+                }
+            }
+            SessionMsg::RetryRecorder => {
+                if !state.shutting_down && state.recorder_cell.is_none() {
+                    state
+                        .recorder_restarts
+                        .maybe_reset(&children::RECORDER_RESTART_BUDGET);
+                    if !children::try_restart_recorder(myself.get_cell(), state).await {
+                        myself.send_after(RECORDER_RETRY_DELAY, || SessionMsg::RetryRecorder);
+                    }
+                }
+            }
+            SessionMsg::RetryListener => {
+                retry_listener(myself, state).await;
+            }
+            SessionMsg::UpdateConfig(update) => {
+                update_config(myself, state, update).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_supervisor_evt(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        message: SupervisionEvent,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        let span = session_span(&state.ctx.params.session_id);
+        async {
+            state
+                .recorder_restarts
+                .maybe_reset(&children::RECORDER_RESTART_BUDGET);
+
+            if state.shutting_down {
+                return Ok(());
+            }
+
+            match message {
+                SupervisionEvent::ActorStarted(_) | SupervisionEvent::ProcessGroupChanged(_) => {}
+
+                SupervisionEvent::ActorTerminated(cell, _, reason) => {
+                    match children::identify_child(state, &cell) {
+                        Some(ChildKind::Listener) => {
+                            tracing::info!(?reason, "listener_terminated");
+                            state.listener_cell = None;
+                            handle_listener_failure(
+                                &myself,
+                                state,
+                                mode::parse_degraded_reason(reason.as_ref()),
+                                None,
+                            )
+                            .await;
+                        }
+                        Some(ChildKind::Source) => {
+                            tracing::info!(?reason, "source_terminated_attempting_restart");
+                            state.source_cell = None;
+                            let is_device_change = reason.as_deref() == Some("device_change");
+                            if !children::try_restart_source(
+                                myself.get_cell(),
+                                state,
+                                !is_device_change,
+                            )
+                            .await
+                            {
+                                tracing::error!("source_restart_limit_exceeded_meltdown");
+                                meltdown(myself, state).await;
+                            } else {
+                                refresh_listener_on_isolation_change(&myself, state).await;
+                            }
+                        }
+                        Some(ChildKind::Recorder) => {
+                            tracing::info!(?reason, "recorder_terminated_attempting_restart");
+                            state.recorder_cell = None;
+                            children::sync_source_recorder(state).await;
+                            emit_storage_error(
+                                &state.ctx,
+                                reason.as_deref().unwrap_or("Audio saving stopped"),
+                            );
+                            myself.send_after(RECORDER_RETRY_DELAY, || SessionMsg::RetryRecorder);
+                        }
+                        None => {
+                            tracing::warn!("unknown_child_terminated");
+                        }
+                    }
+                }
+                SupervisionEvent::ActorFailed(cell, error) => {
+                    match children::identify_child(state, &cell) {
+                        Some(ChildKind::Listener) => {
+                            tracing::info!(?error, "listener_failed");
+                            state.listener_cell = None;
+                            handle_listener_failure(
+                                &myself,
+                                state,
+                                DegradedError::StreamError {
+                                    message: format!("{:?}", error),
+                                },
+                                None,
+                            )
+                            .await;
+                        }
+                        Some(ChildKind::Source) => {
+                            tracing::warn!(?error, "source_failed_attempting_restart");
+                            state.source_cell = None;
+                            if !children::try_restart_source(myself.get_cell(), state, true).await {
+                                tracing::error!("source_restart_limit_exceeded_meltdown");
+                                meltdown(myself, state).await;
+                            } else {
+                                refresh_listener_on_isolation_change(&myself, state).await;
+                            }
+                        }
+                        Some(ChildKind::Recorder) => {
+                            tracing::warn!(?error, "recorder_failed_attempting_restart");
+                            state.recorder_cell = None;
+                            children::sync_source_recorder(state).await;
+                            emit_storage_error(&state.ctx, &error.to_string());
+                            myself.send_after(RECORDER_RETRY_DELAY, || SessionMsg::RetryRecorder);
+                        }
+                        None => {
+                            tracing::warn!("unknown_child_failed");
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        .instrument(span)
+        .await
+    }
+    async fn post_stop(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        children::shutdown_children(state, "session_stop").await;
+        if state.ctx.params.retain_audio == Some(false) {
+            let dir = crate::actors::recorder::find_session_dir(
+                &state.ctx.app_dir,
+                &state.ctx.params.session_id,
+            );
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                crate::actors::recorder::delete_transcribed_capture_audio(&dir).map(|_| ())
+            })
+            .await?
+            {
+                let error = format!("audio_deletion_failed: {error}");
+                state
+                    .ctx
+                    .runtime
+                    .emit_error(crate::SessionErrorEvent::AudioError {
+                        session_id: state.ctx.params.session_id.clone(),
+                        error: error.clone(),
+                        device: None,
+                        is_fatal: false,
+                    });
+                return Err(std::io::Error::other(error).into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn emit_storage_error(ctx: &SessionContext, error: &str) {
+    ctx.runtime
+        .emit_error(crate::SessionErrorEvent::AudioError {
+            session_id: ctx.params.session_id.clone(),
+            error: format!("audio_storage_unavailable: {error}"),
+            device: None,
+            is_fatal: false,
+        });
+}
+
+pub async fn spawn_session_supervisor(
+    ctx: SessionContext,
+) -> Result<(ActorCell, tokio::task::JoinHandle<()>), ActorProcessingErr> {
+    let supervisor_name = session_supervisor_name(&ctx.params.session_id);
+    let (actor_ref, handle) = Actor::spawn(Some(supervisor_name), SessionActor, ctx).await?;
+    Ok((actor_ref.get_cell(), handle))
+}
+
+async fn emit_active_lifecycle_event(state: &SessionState, error: Option<DegradedError>) {
+    state.ctx.runtime.emit_lifecycle(
+        state
+            .mode
+            .active_event(state.ctx.params.session_id.clone(), error),
+    );
+}
+
+async fn enter_batch_fallback(state: &mut SessionState, degraded: DegradedError) {
+    state.mode.enter_batch_fallback();
+    children::attach_listener_to_source(state).await;
+    emit_active_lifecycle_event(state, Some(degraded)).await;
+}
+
+async fn update_config(
+    myself: ActorRef<SessionMsg>,
+    state: &mut SessionState,
+    update: SessionConfigUpdate,
+) {
+    if update.session_id != state.ctx.params.session_id {
+        return;
+    }
+
+    let should_refresh_listener = state.mode.should_spawn_listener()
+        && update_requires_listener_refresh(&state.ctx.params, &update);
+
+    state.ctx.params.languages = update.languages;
+    state.ctx.params.participant_human_ids = update.participant_human_ids;
+    state.ctx.params.self_human_id = update.self_human_id;
+    state.ctx.params.speaker_assignments = update.speaker_assignments;
+
+    if should_refresh_listener {
+        refresh_listener(myself, state).await;
+        return;
+    }
+
+    if let Some(listener_cell) = &state.listener_cell {
+        let listener_ref: ractor::ActorRef<ListenerMsg> = listener_cell.clone().into();
+        if let Err(error) = listener_ref.cast(ListenerMsg::UpdateConfig(ListenerConfigUpdate {
+            languages: state.ctx.params.languages.clone(),
+            participant_human_ids: state.ctx.params.participant_human_ids.clone(),
+            self_human_id: state.ctx.params.self_human_id.clone(),
+            speaker_assignments: state.ctx.params.speaker_assignments.clone(),
+        })) {
+            tracing::warn!(?error, "failed_to_cast_listener_config_update");
+        }
+    }
+}
+
+async fn refresh_listener(myself: ActorRef<SessionMsg>, state: &mut SessionState) {
+    let replay_duration_secs = children::stop_listener(state, "config_update").await;
+
+    if !state.mode.should_spawn_listener() {
+        return;
+    }
+
+    let replay_offset_secs =
+        (state.ctx.started_at_instant.elapsed().as_secs_f64() - replay_duration_secs).max(0.0);
+
+    match children::spawn_listener(myself.get_cell(), &state.ctx, Some(replay_offset_secs)).await {
+        Ok((listener_cell, mic_isolated)) => {
+            state.listener_cell = Some(listener_cell);
+            state.listener_mic_isolated = mic_isolated;
+            state.mode.on_listener_attached();
+            children::attach_listener_to_source(state).await;
+        }
+        Err(error) => {
+            tracing::warn!(?error, "listener_refresh_failed");
+            let retry_after = listener_retry_after(&error);
+            let degraded = classify_listener_spawn_failure(state, &error);
+            handle_listener_failure(&myself, state, degraded, retry_after).await;
+        }
+    }
+}
+
+// A source restart can change audio routing (headphones unplugging, a mic swap),
+// which can flip the mic-isolation verdict the listener's provider session was
+// opened with. That session cannot be renegotiated, so refresh the listener.
+async fn refresh_listener_on_isolation_change(
+    myself: &ActorRef<SessionMsg>,
+    state: &mut SessionState,
+) {
+    if state.listener_cell.is_none() {
+        return;
+    }
+
+    let mic_isolated = children::source_mic_isolated(&state.ctx).await;
+    if mic_isolated != state.listener_mic_isolated {
+        refresh_listener(myself.clone(), state).await;
+    }
+}
+
+fn update_requires_listener_refresh(current: &SessionParams, update: &SessionConfigUpdate) -> bool {
+    current.languages != update.languages
+        || expected_speaker_count(
+            &current.participant_human_ids,
+            current.self_human_id.as_deref(),
+        ) != expected_speaker_count(
+            &update.participant_human_ids,
+            update.self_human_id.as_deref(),
+        )
+}
+
+fn expected_speaker_count(
+    participant_human_ids: &[String],
+    self_human_id: Option<&str>,
+) -> Option<u32> {
+    crate::expected_speakers_per_channel(participant_human_ids, self_human_id)
+}
+
+async fn handle_listener_failure(
+    myself: &ActorRef<SessionMsg>,
+    state: &mut SessionState,
+    degraded: DegradedError,
+    retry_after: Option<Duration>,
+) {
+    if should_stop_on_listener_failure(state) {
+        tracing::warn!("listener_failed_stopping_session");
+        stop_after_listener_failure(myself, state, degraded).await;
+    } else {
+        let should_retry = should_retry_listener_failure(&degraded);
+        enter_batch_fallback(state, degraded).await;
+        if should_retry {
+            schedule_listener_retry(myself, state, retry_after);
+        }
+    }
+}
+
+fn should_retry_listener_failure(degraded: &DegradedError) -> bool {
+    !matches!(
+        degraded,
+        DegradedError::AuthenticationFailed { .. } | DegradedError::ProviderConfiguration { .. }
+    )
+}
+
+fn classify_listener_spawn_failure(
+    state: &SessionState,
+    error: &ractor::SpawnErr,
+) -> DegradedError {
+    if let ractor::SpawnErr::StartupFailed(error) = error
+        && let Some(listener_error) = error.downcast_ref::<ListenerInitError>()
+        && let Some(degraded) = &listener_error.degraded
+    {
+        return degraded.clone();
+    }
+
+    if should_stop_on_listener_failure(state) {
+        DegradedError::StreamError {
+            message: error.to_string(),
+        }
+    } else {
+        DegradedError::UpstreamUnavailable {
+            message: mode::classify_connection_failure(&state.ctx.params.base_url),
+        }
+    }
+}
+
+fn listener_retry_after(error: &ractor::SpawnErr) -> Option<Duration> {
+    let ractor::SpawnErr::StartupFailed(error) = error else {
+        return None;
+    };
+    error
+        .downcast_ref::<ListenerInitError>()
+        .and_then(|error| error.retry_after)
+}
+
+fn schedule_listener_retry(
+    myself: &ActorRef<SessionMsg>,
+    state: &mut SessionState,
+    retry_after: Option<Duration>,
+) {
+    let delay = listener_retry_delay(
+        state.listener_retry_attempt,
+        retry_after,
+        &state.ctx.params.session_id,
+    );
+    state.listener_retry_attempt = state.listener_retry_attempt.saturating_add(1);
+    tracing::info!(
+        ?delay,
+        ?retry_after,
+        attempt = state.listener_retry_attempt,
+        "listener_retry_scheduled"
+    );
+    myself.send_after(delay, || SessionMsg::RetryListener);
+}
+
+fn listener_retry_base_delay(attempt: usize) -> Duration {
+    LISTENER_RETRY_DELAYS[attempt.min(LISTENER_RETRY_DELAYS.len() - 1)]
+}
+
+fn listener_retry_delay(
+    attempt: usize,
+    retry_after: Option<Duration>,
+    session_id: &str,
+) -> Duration {
+    let scheduled = listener_retry_base_delay(attempt);
+    let base = retry_after.map_or(scheduled, |minimum| {
+        scheduled.max(minimum.min(MAX_LISTENER_RETRY_AFTER))
+    });
+    let base_ms = base.as_millis().min(u64::MAX as u128) as u64;
+    let jitter_limit_ms = base_ms / 5;
+    let mut hasher = DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let jitter_ms = hasher.finish() % jitter_limit_ms.saturating_add(1);
+    Duration::from_millis(base_ms.saturating_add(jitter_ms))
+}
+
+async fn retry_listener(myself: ActorRef<SessionMsg>, state: &mut SessionState) {
+    if state.shutting_down || state.listener_cell.is_some() || !state.mode.should_retry_listener() {
+        return;
+    }
+
+    let replay_duration_secs = children::prepare_listener_refresh(state).await;
+    let replay_offset_secs =
+        (state.ctx.started_at_instant.elapsed().as_secs_f64() - replay_duration_secs).max(0.0);
+
+    match children::spawn_listener(myself.get_cell(), &state.ctx, Some(replay_offset_secs)).await {
+        Ok((listener_cell, mic_isolated)) => {
+            tracing::info!(
+                attempts = state.listener_retry_attempt,
+                "listener_reconnected"
+            );
+            state.listener_cell = Some(listener_cell);
+            state.listener_mic_isolated = mic_isolated;
+            state.listener_retry_attempt = 0;
+            state.mode.on_listener_attached();
+            children::attach_listener_to_source(state).await;
+            emit_active_lifecycle_event(state, None).await;
+        }
+        Err(error) => {
+            tracing::warn!(?error, "listener_retry_failed");
+            let retry_after = listener_retry_after(&error);
+            let degraded = classify_listener_spawn_failure(state, &error);
+            handle_listener_failure(&myself, state, degraded, retry_after).await;
+        }
+    }
+}
+
+fn should_stop_on_listener_failure(state: &SessionState) -> bool {
+    state.ctx.params.uses_local_soniqo_live_model()
+        || state.ctx.params.uses_local_apple_speech_live_model()
+}
+
+async fn stop_after_listener_failure(
+    myself: &ActorRef<SessionMsg>,
+    state: &mut SessionState,
+    degraded: DegradedError,
+) {
+    emit_active_lifecycle_event(state, Some(degraded.clone())).await;
+    state.shutting_down = true;
+    children::shutdown_children(state, "listener_failure").await;
+    let reason = serde_json::to_string(&degraded).ok();
+    myself.stop(reason);
+}
+
+async fn meltdown(myself: ActorRef<SessionMsg>, state: &mut SessionState) {
+    state.shutting_down = true;
+    children::shutdown_children(state, "meltdown").await;
+    myself.stop(Some("restart_limit_exceeded".to_string()));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{Instant, SystemTime};
+
+    use anlg_audio::{AudioProvider, CaptureConfig, CaptureStream};
+    use anlg_supervisor::RestartTracker;
+    use ractor::ActorStatus;
+
+    use super::*;
+    use crate::{
+        ListenerRuntime, SessionDataEvent, SessionErrorEvent, SessionProgressEvent,
+        TranscriptionMode, actors::SessionParams,
+    };
+
+    struct TestRuntime;
+
+    impl anlg_storage::StorageRuntime for TestRuntime {
+        fn global_base(&self) -> Result<PathBuf, anlg_storage::Error> {
+            Ok(std::env::temp_dir())
+        }
+
+        fn vault_base(&self) -> Result<PathBuf, anlg_storage::Error> {
+            Ok(std::env::temp_dir())
+        }
+    }
+
+    impl ListenerRuntime for TestRuntime {
+        fn emit_lifecycle(&self, _event: crate::SessionLifecycleEvent) {}
+
+        fn emit_progress(&self, _event: SessionProgressEvent) {}
+
+        fn emit_error(&self, _event: SessionErrorEvent) {}
+
+        fn emit_data(&self, _event: SessionDataEvent) {}
+    }
+
+    impl AudioProvider for TestRuntime {
+        fn open_capture(&self, _config: CaptureConfig) -> Result<CaptureStream, anlg_audio::Error> {
+            Ok(CaptureStream::new(futures_util::stream::pending()))
+        }
+        fn open_speaker_capture(
+            &self,
+            _sample_rate: u32,
+            _chunk_size: usize,
+        ) -> Result<CaptureStream, anlg_audio::Error> {
+            unimplemented!()
+        }
+        fn open_mic_capture(
+            &self,
+            _device: Option<String>,
+            _sample_rate: u32,
+            _chunk_size: usize,
+        ) -> Result<CaptureStream, anlg_audio::Error> {
+            unimplemented!()
+        }
+        fn default_device_name(&self) -> String {
+            "test".to_string()
+        }
+        fn list_mic_devices(&self) -> Vec<String> {
+            vec![]
+        }
+        fn play_silence(&self) -> std::sync::mpsc::Sender<()> {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            tx
+        }
+        fn play_bytes(&self, _bytes: &'static [u8]) -> std::sync::mpsc::Sender<()> {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            tx
+        }
+        fn probe_mic(&self, _device: Option<String>) -> Result<(), anlg_audio::Error> {
+            Ok(())
+        }
+        fn probe_speaker(&self) -> Result<(), anlg_audio::Error> {
+            Ok(())
+        }
+    }
+
+    struct StopProbe {
+        label: &'static str,
+        tx: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    }
+
+    #[ractor::async_trait]
+    impl Actor for StopProbe {
+        type Msg = ();
+        type State = ();
+        type Arguments = ();
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(())
+        }
+
+        async fn post_stop(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            let _ = self.tx.send(self.label);
+            Ok(())
+        }
+    }
+
+    pub(super) struct SessionStopProbe;
+
+    struct SessionRetryProbe(tokio::sync::mpsc::UnboundedSender<()>);
+
+    #[ractor::async_trait]
+    impl Actor for SessionRetryProbe {
+        type Msg = SessionMsg;
+        type State = ();
+        type Arguments = ();
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(())
+        }
+
+        async fn handle(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            message: Self::Msg,
+            _state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            if matches!(message, SessionMsg::RetryListener) {
+                let _ = self.0.send(());
+            }
+            Ok(())
+        }
+    }
+
+    #[ractor::async_trait]
+    impl Actor for SessionStopProbe {
+        type Msg = SessionMsg;
+        type State = ();
+        type Arguments = ();
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _args: Self::Arguments,
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(())
+        }
+    }
+
+    struct RecordingRuntime {
+        lifecycle_events: std::sync::Mutex<Vec<crate::SessionLifecycleEvent>>,
+    }
+
+    impl anlg_storage::StorageRuntime for RecordingRuntime {
+        fn global_base(&self) -> Result<PathBuf, anlg_storage::Error> {
+            Ok(std::env::temp_dir())
+        }
+
+        fn vault_base(&self) -> Result<PathBuf, anlg_storage::Error> {
+            Ok(std::env::temp_dir())
+        }
+    }
+
+    impl ListenerRuntime for RecordingRuntime {
+        fn emit_lifecycle(&self, event: crate::SessionLifecycleEvent) {
+            self.lifecycle_events.lock().unwrap().push(event);
+        }
+
+        fn emit_progress(&self, _event: SessionProgressEvent) {}
+
+        fn emit_error(&self, _event: SessionErrorEvent) {}
+
+        fn emit_data(&self, _event: SessionDataEvent) {}
+    }
+
+    pub(super) fn test_ctx() -> SessionContext {
+        SessionContext {
+            runtime: Arc::new(TestRuntime),
+            audio: Arc::new(TestRuntime),
+            requested_transcription_mode: crate::TranscriptionMode::Live,
+            params: SessionParams {
+                retain_audio: None,
+                session_id: "session".to_string(),
+                languages: vec![],
+                onboarding: false,
+                transcription_mode: crate::TranscriptionMode::Live,
+                model: "test-model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                api_key: "test-key".to_string(),
+                keywords: vec![],
+                mic_device: None,
+                participant_human_ids: vec![],
+                self_human_id: None,
+                speaker_assignments: vec![],
+            },
+            app_dir: std::env::temp_dir(),
+            started_at_instant: Instant::now(),
+            started_at_system: SystemTime::now(),
+            live_transcript: Default::default(),
+        }
+    }
+
+    pub(super) fn test_state(ctx: SessionContext) -> SessionState {
+        SessionState {
+            ctx,
+            source_cell: None,
+            listener_cell: None,
+            recorder_cell: None,
+            source_restarts: RestartTracker::new(),
+            recorder_restarts: RestartTracker::new(),
+            mode: SessionModeState::new(TranscriptionMode::Live, TranscriptionMode::Live),
+            listener_retry_attempt: 0,
+            listener_mic_isolated: false,
+            shutting_down: false,
+        }
+    }
+
+    fn test_update(
+        languages: Vec<anlg_language::Language>,
+        participant_human_ids: Vec<&str>,
+        self_human_id: Option<&str>,
+    ) -> SessionConfigUpdate {
+        SessionConfigUpdate {
+            session_id: "session".to_string(),
+            languages,
+            participant_human_ids: participant_human_ids
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+            self_human_id: self_human_id.map(ToString::to_string),
+            speaker_assignments: vec![],
+        }
+    }
+
+    #[test]
+    fn config_update_keeps_stream_for_participant_and_speaker_changes() {
+        let mut ctx = test_ctx();
+        ctx.params.participant_human_ids = vec!["self".to_string(), "remote-a".to_string()];
+        ctx.params.self_human_id = Some("self".to_string());
+        let state = test_state(ctx);
+        let mut update = test_update(vec![], vec!["self", "remote-a"], Some("self"));
+        update.speaker_assignments = vec![anlg_transcript::IdentityAssignment {
+            human_id: "remote-a".to_string(),
+            scope: anlg_transcript::IdentityScope::ChannelSpeaker {
+                channel: anlg_transcript::ChannelProfile::RemoteParty,
+                speaker_index: 0,
+            },
+        }];
+        assert!(
+            !update_requires_listener_refresh(&state.ctx.params, &update),
+            "speaker assignments"
+        );
+
+        let mut ctx = test_ctx();
+        ctx.params.participant_human_ids = vec!["self".to_string()];
+        ctx.params.self_human_id = Some("self".to_string());
+        let state = test_state(ctx);
+        let update = test_update(vec![], vec!["self", "remote-a", "remote-b"], Some("self"));
+        assert!(
+            !update_requires_listener_refresh(&state.ctx.params, &update),
+            "calendar attendance"
+        );
+
+        let mut ctx = test_ctx();
+        ctx.params.participant_human_ids = vec!["self".to_string(), "remote-a".to_string()];
+        ctx.params.self_human_id = Some("self".to_string());
+        let state = test_state(ctx);
+        let update = test_update(vec![], vec!["self", "remote-b"], Some("self"));
+        assert!(
+            !update_requires_listener_refresh(&state.ctx.params, &update),
+            "same speaker count"
+        );
+    }
+
+    #[test]
+    fn config_update_refreshes_when_languages_change() {
+        let mut ctx = test_ctx();
+        ctx.params.languages = vec![anlg_language::ISO639::En.into()];
+        let state = test_state(ctx);
+        let update = test_update(
+            vec![
+                anlg_language::ISO639::En.into(),
+                anlg_language::ISO639::Ko.into(),
+            ],
+            vec![],
+            None,
+        );
+
+        assert!(update_requires_listener_refresh(&state.ctx.params, &update));
+    }
+
+    #[test]
+    fn only_local_soniqo_live_listener_failure_stops_session() {
+        for (base_url, model, expected_stop, label) in [
+            (
+                anlg_transcribe_soniqo::LOCAL_BASE_URL,
+                "soniqo-parakeet-streaming",
+                true,
+                "local soniqo live",
+            ),
+            (
+                "https://api.soniox.com",
+                "stt-v4",
+                false,
+                "direct soniox preserves recording",
+            ),
+            (
+                "https://api.anarlog.so/stt?provider=soniox",
+                "cloud",
+                false,
+                "anarlog proxy soniox enters batch fallback",
+            ),
+            (
+                "http://localhost:1234",
+                "test-model",
+                false,
+                "non-soniqo enters batch fallback",
+            ),
+        ] {
+            let mut ctx = test_ctx();
+            ctx.params.base_url = base_url.to_string();
+            ctx.params.model = model.to_string();
+            let state = test_state(ctx);
+
+            assert_eq!(
+                should_stop_on_listener_failure(&state),
+                expected_stop,
+                "case: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_listener_failures_retry_with_capped_backoff() {
+        assert!(should_retry_listener_failure(
+            &DegradedError::ConnectionTimeout
+        ));
+        assert_eq!(listener_retry_base_delay(0), Duration::from_secs(2));
+        assert_eq!(listener_retry_base_delay(3), Duration::from_secs(20));
+        assert_eq!(listener_retry_base_delay(20), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn listener_retry_delay_adds_jitter_and_honors_retry_after() {
+        let normal = listener_retry_delay(0, None, "session-a");
+        assert!(normal >= Duration::from_secs(2));
+        assert!(normal <= Duration::from_millis(2_400));
+
+        let rate_limited = listener_retry_delay(0, Some(Duration::from_secs(60)), "session-a");
+        assert!(rate_limited >= Duration::from_secs(30));
+        assert!(rate_limited <= Duration::from_secs(36));
+    }
+
+    #[test]
+    fn permanent_listener_failures_do_not_retry() {
+        assert!(!should_retry_listener_failure(
+            &DegradedError::AuthenticationFailed {
+                provider: "test".to_string(),
+            }
+        ));
+        let degraded = DegradedError::ProviderConfiguration {
+            provider: "test".to_string(),
+            message: "invalid endpoint".to_string(),
+        };
+        assert!(!should_retry_listener_failure(&degraded));
+
+        let error = ractor::SpawnErr::StartupFailed(Box::new(ListenerInitError {
+            message: "listener failed".to_string(),
+            degraded: Some(degraded),
+            retry_after: Some(Duration::from_secs(7)),
+        }));
+        assert_eq!(listener_retry_after(&error), Some(Duration::from_secs(7)));
+        assert!(matches!(
+            classify_listener_spawn_failure(&test_state(test_ctx()), &error),
+            DegradedError::ProviderConfiguration { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_after_listener_failure_emits_degraded_active_event() {
+        let runtime = Arc::new(RecordingRuntime {
+            lifecycle_events: std::sync::Mutex::new(vec![]),
+        });
+        let mut ctx = test_ctx();
+        ctx.runtime = runtime.clone();
+        let mut state = test_state(ctx);
+        let (actor_ref, handle) = Actor::spawn(None, SessionStopProbe, ()).await.unwrap();
+
+        stop_after_listener_failure(
+            &actor_ref,
+            &mut state,
+            DegradedError::StreamError {
+                message: "listener failed".to_string(),
+            },
+        )
+        .await;
+
+        {
+            let events = runtime.lifecycle_events.lock().unwrap();
+            let Some(crate::SessionLifecycleEvent::Active {
+                requested_transcription_mode,
+                current_transcription_mode,
+                error: Some(DegradedError::StreamError { message }),
+                ..
+            }) = events.first()
+            else {
+                panic!("expected degraded active event");
+            };
+            assert_eq!(*requested_transcription_mode, TranscriptionMode::Live);
+            assert_eq!(*current_transcription_mode, TranscriptionMode::Live);
+            assert_eq!(message, "listener failed");
+        }
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn stalled_cloud_and_soniox_listeners_schedule_reconnection_without_stopping_recording() {
+        for base_url in ["https://api.anarlog.so/stt", "https://api.soniox.com"] {
+            let runtime = Arc::new(RecordingRuntime {
+                lifecycle_events: std::sync::Mutex::new(vec![]),
+            });
+            let mut ctx = test_ctx();
+            ctx.runtime = runtime.clone();
+            ctx.params.base_url = base_url.to_string();
+            let mut state = test_state(ctx);
+            let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (recorder, recorder_handle) = Actor::spawn(
+                None,
+                StopProbe {
+                    label: "recorder",
+                    tx: stop_tx,
+                },
+                (),
+            )
+            .await
+            .unwrap();
+            state.recorder_cell = Some(recorder.get_cell());
+            let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (supervisor, supervisor_handle) =
+                Actor::spawn(None, SessionRetryProbe(retry_tx), ())
+                    .await
+                    .unwrap();
+
+            handle_listener_failure(
+                &supervisor,
+                &mut state,
+                DegradedError::ConnectionTimeout,
+                None,
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(3), retry_rx.recv())
+                .await
+                .expect("stalled streams should schedule a reconnect")
+                .unwrap();
+            assert!(!state.shutting_down);
+            assert!(state.mode.should_retry_listener());
+            assert_eq!(recorder.get_status(), ActorStatus::Running);
+            assert!(stop_rx.try_recv().is_err());
+            assert!(matches!(
+                runtime.lifecycle_events.lock().unwrap().last(),
+                Some(crate::SessionLifecycleEvent::Active {
+                    requested_transcription_mode: TranscriptionMode::Live,
+                    current_transcription_mode: TranscriptionMode::Batch,
+                    error: Some(DegradedError::ConnectionTimeout),
+                    ..
+                })
+            ));
+
+            recorder.stop(None);
+            supervisor.stop(None);
+            recorder_handle.await.unwrap();
+            supervisor_handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recorder_failure_keeps_the_listener_and_session_running() {
+        let (supervisor, supervisor_task) = Actor::spawn(None, SessionStopProbe, ()).await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (recorder, recorder_task) = Actor::spawn(
+            None,
+            StopProbe {
+                label: "recorder",
+                tx: tx.clone(),
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        let (listener, listener_task) = Actor::spawn(
+            None,
+            StopProbe {
+                label: "listener",
+                tx,
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        let mut state = test_state(test_ctx());
+        state.recorder_cell = Some(recorder.get_cell());
+        state.listener_cell = Some(listener.get_cell());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while listener.get_status() != ractor::ActorStatus::Running {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        SessionActor
+            .handle_supervisor_evt(
+                supervisor.clone(),
+                SupervisionEvent::ActorFailed(
+                    recorder.get_cell(),
+                    std::io::Error::other("No space left on device").into(),
+                ),
+                &mut state,
+            )
+            .await
+            .unwrap();
+        assert!(!state.shutting_down);
+        assert!(state.recorder_cell.is_none());
+        assert_eq!(state.listener_cell.unwrap().get_id(), listener.get_id());
+        assert_eq!(listener.get_status(), ractor::ActorStatus::Running);
+        supervisor_task.abort();
+        recorder_task.abort();
+        listener_task.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_children_waits_in_source_listener_recorder_order() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (source_ref, _) = Actor::spawn(
+            None,
+            StopProbe {
+                label: "source",
+                tx: tx.clone(),
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        let (listener_ref, _) = Actor::spawn(
+            None,
+            StopProbe {
+                label: "listener",
+                tx: tx.clone(),
+            },
+            (),
+        )
+        .await
+        .unwrap();
+        let (recorder_ref, _) = Actor::spawn(
+            None,
+            StopProbe {
+                label: "recorder",
+                tx,
+            },
+            (),
+        )
+        .await
+        .unwrap();
+
+        let mut state = SessionState {
+            ctx: test_ctx(),
+            source_cell: Some(source_ref.get_cell()),
+            listener_cell: Some(listener_ref.get_cell()),
+            recorder_cell: Some(recorder_ref.get_cell()),
+            source_restarts: RestartTracker::new(),
+            recorder_restarts: RestartTracker::new(),
+            mode: SessionModeState::new(TranscriptionMode::Live, TranscriptionMode::Live),
+            listener_retry_attempt: 0,
+            listener_mic_isolated: false,
+            shutting_down: false,
+        };
+
+        children::shutdown_children(&mut state, "test_shutdown").await;
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let third = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!([first, second, third], ["source", "listener", "recorder"]);
+        assert_eq!(source_ref.get_status(), ActorStatus::Stopped);
+        assert_eq!(listener_ref.get_status(), ActorStatus::Stopped);
+        assert_eq!(recorder_ref.get_status(), ActorStatus::Stopped);
+    }
+}

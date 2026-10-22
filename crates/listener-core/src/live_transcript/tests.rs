@@ -1,0 +1,1088 @@
+use owhisper_interface::stream::{Alternatives, Channel, Metadata, ModelInfo, Word};
+
+use super::*;
+
+fn transcript_response_at(
+    transcript: &str,
+    words: Vec<Word>,
+    is_final: bool,
+    channel_idx: i32,
+    start: f64,
+    duration: f64,
+) -> StreamResponse {
+    StreamResponse::TranscriptResponse {
+        start,
+        duration,
+        is_final,
+        speech_final: is_final,
+        from_finalize: false,
+        channel: Channel {
+            alternatives: vec![Alternatives {
+                transcript: transcript.to_string(),
+                words,
+                confidence: 1.0,
+                languages: vec![],
+            }],
+        },
+        metadata: Metadata {
+            request_id: "request".to_string(),
+            model_info: ModelInfo {
+                name: "model".to_string(),
+                version: "1".to_string(),
+                arch: "test".to_string(),
+            },
+            model_uuid: "uuid".to_string(),
+            extra: None,
+        },
+        channel_index: vec![channel_idx, 2],
+    }
+}
+
+fn word(text: &str, start: f64, end: f64) -> Word {
+    Word {
+        word: text.to_string(),
+        start,
+        end,
+        confidence: 1.0,
+        speaker: None,
+        punctuated_word: Some(text.to_string()),
+        language: None,
+    }
+}
+
+fn words_from_text(text: &str, start: f64, duration: f64) -> Vec<Word> {
+    let parts = text.split_whitespace().collect::<Vec<_>>();
+    let count = parts.len();
+
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let word_start = start + (index as f64 / count as f64) * duration;
+            let word_end = start + ((index + 1) as f64 / count as f64) * duration;
+            word(part, word_start, word_end)
+        })
+        .collect()
+}
+
+#[test]
+fn soniqo_normalizer_retimes_cumulative_partials() {
+    let mut normalizer = SoniqoTranscriptNormalizer::default();
+
+    let mut first =
+        transcript_response_at("see", vec![word("see", 0.0, 0.25)], false, 0, 0.0, 0.25);
+    normalizer.normalize(&mut first);
+
+    let mut second = transcript_response_at(
+        "see the need",
+        vec![
+            word("see", 0.25, 0.33),
+            word("the", 0.33, 0.41),
+            word("need", 0.41, 0.50),
+        ],
+        false,
+        0,
+        0.25,
+        0.25,
+    );
+    normalizer.normalize(&mut second);
+
+    let StreamResponse::TranscriptResponse {
+        start,
+        duration,
+        channel,
+        ..
+    } = second
+    else {
+        panic!("expected transcript response");
+    };
+    let words = &channel.alternatives[0].words;
+
+    assert_eq!(start, 0.0);
+    assert_eq!(duration, 0.5);
+    assert_eq!(words.len(), 3);
+    assert_eq!(words[0].word, "see");
+    assert_eq!(words[0].start, 0.0);
+    assert_eq!(words[2].end, 0.45);
+}
+
+#[test]
+fn soniqo_normalizer_trims_sliding_overlap() {
+    let mut normalizer = SoniqoTranscriptNormalizer::default();
+
+    let mut first = transcript_response_at(
+        "see the need",
+        vec![
+            word("see", 0.0, 0.20),
+            word("the", 0.20, 0.40),
+            word("need", 0.40, 0.60),
+        ],
+        false,
+        0,
+        0.0,
+        0.60,
+    );
+    normalizer.normalize(&mut first);
+
+    let mut second = transcript_response_at(
+        "the need now",
+        vec![
+            word("the", 0.60, 0.70),
+            word("need", 0.70, 0.80),
+            word("now", 0.80, 0.90),
+        ],
+        false,
+        0,
+        0.60,
+        0.30,
+    );
+    normalizer.normalize(&mut second);
+
+    let StreamResponse::TranscriptResponse { channel, .. } = second else {
+        panic!("expected transcript response");
+    };
+    let alternative = &channel.alternatives[0];
+
+    assert_eq!(alternative.transcript, "now");
+    assert_eq!(
+        alternative
+            .words
+            .iter()
+            .map(|word| word.word.as_str())
+            .collect::<Vec<_>>(),
+        vec!["now"],
+    );
+}
+
+#[test]
+fn soniqo_normalizer_updates_active_tokens_when_overlap_drains_partial() {
+    let mut normalizer = SoniqoTranscriptNormalizer::default();
+
+    let mut first = transcript_response_at(
+        "see the need",
+        vec![
+            word("see", 0.0, 0.20),
+            word("the", 0.20, 0.40),
+            word("need", 0.40, 0.60),
+        ],
+        false,
+        0,
+        0.0,
+        0.60,
+    );
+    normalizer.normalize(&mut first);
+
+    let mut second = transcript_response_at(
+        "the need",
+        vec![word("the", 0.60, 0.70), word("need", 0.70, 0.80)],
+        false,
+        0,
+        0.60,
+        0.20,
+    );
+    normalizer.normalize(&mut second);
+
+    let StreamResponse::TranscriptResponse { channel, .. } = second else {
+        panic!("expected transcript response");
+    };
+    assert!(channel.alternatives[0].words.is_empty());
+
+    let state = normalizer.channels.get(&0).expect("channel state");
+    assert_eq!(state.active_tokens, vec!["the", "need"]);
+    assert_eq!(state.active_start_ms, Some(600));
+}
+
+#[test]
+fn soniqo_prefix_drain_counts_normalized_tokens_not_words() {
+    let mut alternative = Alternatives {
+        transcript: ", the need now".to_string(),
+        words: vec![
+            word(",", 0.60, 0.62),
+            word("the", 0.62, 0.70),
+            word("need", 0.70, 0.80),
+            word("now", 0.80, 0.90),
+        ],
+        confidence: 1.0,
+        languages: vec![],
+    };
+    let mut current_tokens = normalize_tokens_for_overlap(&alternative.words);
+
+    drain_soniqo_prefix(&mut alternative, &mut current_tokens, 2);
+
+    assert_eq!(alternative.transcript, "now");
+    assert_eq!(
+        alternative
+            .words
+            .iter()
+            .map(|word| word.word.as_str())
+            .collect::<Vec<_>>(),
+        vec!["now"],
+    );
+    assert_eq!(current_tokens, vec!["now"]);
+}
+
+#[test]
+fn soniqo_normalizer_drops_repeated_committed_history() {
+    let mut normalizer = SoniqoTranscriptNormalizer::default();
+    let repeated = "and it tested if you feel";
+
+    let mut first = transcript_response_at(
+        repeated,
+        words_from_text(repeated, 0.0, 1.0),
+        true,
+        0,
+        0.0,
+        1.0,
+    );
+    normalizer.normalize(&mut first);
+
+    let mut second = transcript_response_at(
+        repeated,
+        words_from_text(repeated, 10.0, 1.0),
+        true,
+        0,
+        10.0,
+        1.0,
+    );
+    normalizer.normalize(&mut second);
+
+    let StreamResponse::TranscriptResponse { channel, .. } = second else {
+        panic!("expected transcript response");
+    };
+    let alternative = &channel.alternatives[0];
+
+    assert!(alternative.words.is_empty());
+    assert_eq!(alternative.transcript, "");
+}
+
+#[test]
+fn soniqo_normalizer_trims_repeated_committed_prefix_from_later_update() {
+    let mut normalizer = SoniqoTranscriptNormalizer::default();
+    let repeated = "and it tested if you feel";
+    let filler = "centralized online url for";
+    let repeated_with_tail = "and it tested if you feel like new material";
+
+    let mut first = transcript_response_at(
+        repeated,
+        words_from_text(repeated, 0.0, 1.0),
+        true,
+        0,
+        0.0,
+        1.0,
+    );
+    normalizer.normalize(&mut first);
+
+    let mut second =
+        transcript_response_at(filler, words_from_text(filler, 2.0, 1.0), true, 0, 2.0, 1.0);
+    normalizer.normalize(&mut second);
+
+    let mut third = transcript_response_at(
+        repeated_with_tail,
+        words_from_text(repeated_with_tail, 10.0, 1.0),
+        false,
+        0,
+        10.0,
+        1.0,
+    );
+    normalizer.normalize(&mut third);
+
+    let StreamResponse::TranscriptResponse { channel, .. } = third else {
+        panic!("expected transcript response");
+    };
+    let alternative = &channel.alternatives[0];
+
+    assert_eq!(alternative.transcript, "like new material");
+    assert_eq!(
+        alternative
+            .words
+            .iter()
+            .map(|word| word.word.as_str())
+            .collect::<Vec<_>>(),
+        vec!["like", "new", "material"],
+    );
+}
+
+#[test]
+fn soniqo_normalizer_collapses_internal_partial_loop() {
+    let mut normalizer = SoniqoTranscriptNormalizer::default();
+    let looped = concat!(
+        "yeah but but there's super valuable information in there right ",
+        "it's just like it's a little bit like extracting it out of this like junior develop ",
+        "yeah but but there's super valuable information in there right ",
+        "it's just like it's a little bit like extracting it out of this like junior developer's ",
+        "kind of like private freak out it's it's a very difficult problem set because ",
+        "it's so you know yeah but but there's super valuable information in there right ",
+        "it's just like it's a little bit like extracting it out of this like junior developer's ",
+        "kind of like private freak out it's it's a very"
+    );
+
+    let mut response = transcript_response_at(
+        looped,
+        words_from_text(looped, 0.0, 10.0),
+        false,
+        0,
+        0.0,
+        10.0,
+    );
+    normalizer.normalize(&mut response);
+
+    let StreamResponse::TranscriptResponse { channel, .. } = response else {
+        panic!("expected transcript response");
+    };
+    let transcript = &channel.alternatives[0].transcript;
+
+    assert_eq!(transcript.matches("yeah but but").count(), 1);
+    assert!(transcript.contains("private freak out"));
+}
+
+#[test]
+fn soniqo_normalizer_keeps_newer_near_adjacent_internal_rewrite() {
+    let mut normalizer = SoniqoTranscriptNormalizer::default();
+    let looped = concat!(
+        "and something an example i think that should give you pause the big signat ",
+        "and something an example i think that should give you pause the big signature ",
+        "success so far is certainly alpha fold and of course alph ",
+        "and something an example i think that should give you pause the big signature ",
+        "success so far is certainly alpha fold and of course alph actually isn't about ai",
+    );
+
+    let mut response = transcript_response_at(
+        looped,
+        words_from_text(looped, 11.0, 13.0),
+        false,
+        0,
+        11.0,
+        13.0,
+    );
+    normalizer.normalize(&mut response);
+
+    let StreamResponse::TranscriptResponse {
+        start,
+        duration,
+        channel,
+        ..
+    } = response
+    else {
+        panic!("expected transcript response");
+    };
+    let transcript = &channel.alternatives[0].transcript;
+
+    assert!(start > 11.0);
+    assert!(duration < 13.0);
+    assert_eq!(transcript.matches("and something an example").count(), 1);
+    assert!(!transcript.contains("big signat and something"));
+    assert!(transcript.contains("big signature success so far is certainly alpha fold"));
+    assert!(transcript.contains("actually isn't about ai"));
+}
+
+#[test]
+fn soniqo_engine_replaces_cumulative_live_partials() {
+    let mut engine = LiveTranscriptEngine::new("soniqo", &[], None);
+
+    let first = transcript_response_at("see", vec![word("see", 0.0, 0.25)], false, 0, 0.0, 0.25);
+    engine.process(&first).expect("first update");
+
+    let second = transcript_response_at(
+        "see the need",
+        vec![
+            word("see", 0.25, 0.33),
+            word("the", 0.33, 0.41),
+            word("need", 0.41, 0.50),
+        ],
+        false,
+        0,
+        0.25,
+        0.25,
+    );
+    let update = engine.process(&second).expect("second update");
+    let segment_delta = update.segment_delta.expect("segment delta");
+
+    assert_eq!(segment_delta.upserts.len(), 1);
+    assert_eq!(segment_delta.upserts[0].text, "see the need");
+}
+
+#[test]
+fn soniqo_engine_replaces_rewritten_live_partial_snapshots() {
+    let mut engine = LiveTranscriptEngine::new("soniqo", &[], None);
+
+    let first_text = "i've come up with that if you";
+    let first = transcript_response_at(
+        first_text,
+        words_from_text(first_text, 0.0, 0.25),
+        false,
+        0,
+        0.0,
+        0.25,
+    );
+    engine.process(&first).expect("first update");
+
+    let second_text = "i come up with that if you're much smarter actually";
+    let second = transcript_response_at(
+        second_text,
+        words_from_text(second_text, 0.25, 0.25),
+        false,
+        0,
+        0.25,
+        0.25,
+    );
+    let update = engine.process(&second).expect("second update");
+    let segment_delta = update.segment_delta.expect("segment delta");
+
+    assert_eq!(segment_delta.upserts.len(), 1);
+    assert_eq!(segment_delta.upserts[0].text, second_text);
+}
+
+#[test]
+fn soniqo_engine_does_not_persist_repeated_final_history() {
+    let mut engine = LiveTranscriptEngine::new("soniqo", &[], None);
+    let repeated = "and it tested if you feel";
+
+    let first = transcript_response_at(
+        repeated,
+        words_from_text(repeated, 0.0, 1.0),
+        true,
+        0,
+        0.0,
+        1.0,
+    );
+    let first_update = engine.process(&first).expect("first update");
+
+    let second = transcript_response_at(
+        repeated,
+        words_from_text(repeated, 10.0, 1.0),
+        true,
+        0,
+        10.0,
+        1.0,
+    );
+    assert!(engine.process(&second).is_none());
+
+    let flush_update = engine.flush().expect("flush update");
+    let final_text = first_update
+        .transcript_delta
+        .new_words
+        .iter()
+        .chain(flush_update.transcript_delta.new_words.iter())
+        .map(|word| word.text.as_str())
+        .collect::<String>();
+
+    assert_eq!(final_text.trim(), repeated);
+}
+
+#[test]
+fn soniqo_engine_persists_remaining_partial_without_internal_loop() {
+    let mut engine = LiveTranscriptEngine::new("soniqo", &[], None);
+    let looped = concat!(
+        "yeah but but there's super valuable information in there right ",
+        "it's just like it's a little bit like extracting it out of this like junior develop ",
+        "yeah but but there's super valuable information in there right ",
+        "it's just like it's a little bit like extracting it out of this like junior developer's ",
+        "kind of like private freak out it's it's a very difficult problem set because ",
+        "it's so you know yeah but but there's super valuable information in there right ",
+        "it's just like it's a little bit like extracting it out of this like junior developer's ",
+        "kind of like private freak out it's it's a very"
+    );
+    let response = transcript_response_at(
+        looped,
+        words_from_text(looped, 0.0, 10.0),
+        false,
+        0,
+        0.0,
+        10.0,
+    );
+
+    engine.process(&response).expect("partial update");
+    let flush_update = engine.flush().expect("flush update");
+    let segment_delta = flush_update.segment_delta.expect("segment delta");
+    let final_text = flush_update
+        .transcript_delta
+        .new_words
+        .iter()
+        .map(|word| word.text.as_str())
+        .collect::<String>();
+
+    assert!(!flush_update.transcript_delta.new_words.is_empty());
+    assert!(flush_update.transcript_delta.partials.is_empty());
+    assert_eq!(final_text.matches("yeah but but").count(), 1);
+    assert!(final_text.contains("private freak out"));
+    assert!(!segment_delta.upserts.is_empty());
+}
+
+#[test]
+fn soniqo_engine_persists_unfinalized_live_tail_on_flush() {
+    let mut engine = LiveTranscriptEngine::new("soniqo", &[], None);
+    let response = transcript_response_at(
+        "visible final tail",
+        words_from_text("visible final tail", 10.0, 1.0),
+        false,
+        0,
+        10.0,
+        1.0,
+    );
+
+    engine.process(&response).expect("partial update");
+    let flush_update = engine.flush().expect("flush update");
+    let final_text = flush_update
+        .transcript_delta
+        .new_words
+        .iter()
+        .map(|word| word.text.as_str())
+        .collect::<String>();
+
+    assert_eq!(final_text.trim(), "visible final tail");
+    assert!(flush_update.transcript_delta.partials.is_empty());
+}
+
+#[test]
+fn soniqo_engine_persists_model_final_words_on_flush() {
+    let mut engine = LiveTranscriptEngine::new("soniqo", &[], None);
+    let response = transcript_response_at(
+        "hello world",
+        words_from_text("hello world", 0.0, 1.0),
+        true,
+        0,
+        0.0,
+        1.0,
+    );
+
+    let first_update = engine.process(&response).expect("first update");
+    let flush_update = engine.flush().expect("flush update");
+    let final_text = first_update
+        .transcript_delta
+        .new_words
+        .iter()
+        .chain(flush_update.transcript_delta.new_words.iter())
+        .map(|word| word.text.as_str())
+        .collect::<String>();
+
+    assert_eq!(final_text.trim(), "hello world");
+    assert!(flush_update.transcript_delta.partials.is_empty());
+}
+
+#[test]
+fn apple_speech_engine_does_not_commit_volatile_hypotheses() {
+    let mut engine = LiveTranscriptEngine::new("apple-speech", &[], None);
+    let partial = transcript_response_at(
+        "what do you think",
+        words_from_text("what do you think", 0.0, 4.0),
+        false,
+        1,
+        0.0,
+        4.0,
+    );
+    engine.process(&partial).expect("partial update");
+
+    let final_response = transcript_response_at(
+        "what do you think about open source",
+        words_from_text("what do you think about open source", 4.0, 4.0),
+        true,
+        1,
+        4.0,
+        4.0,
+    );
+    let final_update = engine.process(&final_response).expect("final update");
+    let flush_update = engine.flush().expect("flush update");
+    let final_text = final_update
+        .transcript_delta
+        .new_words
+        .iter()
+        .chain(flush_update.transcript_delta.new_words.iter())
+        .map(|word| word.text.as_str())
+        .collect::<String>();
+
+    assert_eq!(final_text.trim(), "what do you think about open source");
+    assert!(flush_update.transcript_delta.partials.is_empty());
+}
+
+#[test]
+fn apple_speech_engine_drops_unfinalized_hypothesis_on_flush() {
+    let mut engine = LiveTranscriptEngine::new("apple-speech", &[], None);
+    let response = transcript_response_at(
+        "volatile tail",
+        words_from_text("volatile tail", 10.0, 1.0),
+        false,
+        1,
+        10.0,
+        1.0,
+    );
+
+    engine.process(&response).expect("partial update");
+    let flush_update = engine.flush().expect("flush update");
+
+    assert!(flush_update.transcript_delta.new_words.is_empty());
+    assert!(flush_update.transcript_delta.partials.is_empty());
+}
+
+#[test]
+fn preserves_provider_speakers_beyond_calendar_attendance() {
+    let mut engine = LiveTranscriptEngine::new("deepgram", &["remote".into()], Some("self"));
+    let mut first = word("first", 0.0, 0.5);
+    first.speaker = Some(0);
+    let mut second = word("second", 0.5, 1.0);
+    second.speaker = Some(7);
+    let response = transcript_response_at("first second", vec![first, second], true, 1, 0.0, 1.0);
+    let update = engine.process(&response).unwrap();
+    let flushed = engine.flush().unwrap();
+    assert_eq!(
+        update
+            .transcript_delta
+            .new_words
+            .iter()
+            .chain(&flushed.transcript_delta.new_words)
+            .map(|word| word.speaker_index)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(7)]
+    );
+    let mut segments = update.segment_delta.unwrap().upserts;
+    segments.extend(flushed.segment_delta.unwrap().upserts);
+    assert!(
+        segments
+            .iter()
+            .any(|segment| segment.key.speaker_index == Some(0))
+    );
+    assert!(
+        segments
+            .iter()
+            .any(|segment| segment.key.speaker_index == Some(7))
+    );
+    assert!(
+        segments
+            .iter()
+            .all(|segment| segment.key.speaker_human_id.is_none())
+    );
+}
+
+// A listener reconnect keeps the session's engine and replays the last few seconds of audio into
+// the new stream, where the provider re-transcribes them with slightly different timing.
+#[test]
+fn checkpointed_engine_ignores_replayed_words_and_keeps_segments_continuous() {
+    let mut engine = LiveTranscriptEngine::new("deepgram", &[], Some("self"));
+    let final_at = |text: &str, start: f64, end: f64| {
+        transcript_response_at(
+            &format!(" {text}"),
+            vec![word(text, start, end)],
+            true,
+            0,
+            start,
+            end - start,
+        )
+    };
+    let emitted = |update: Option<LiveTranscriptUpdate>| {
+        update
+            .map(|update| {
+                update
+                    .transcript_delta
+                    .new_words
+                    .iter()
+                    .map(|word| word.text.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut words = emitted(engine.process(&final_at("hello", 0.0, 0.4)));
+    words.extend(emitted(engine.process(&final_at("there", 0.4, 0.9))));
+    let checkpoint = engine.checkpoint().expect("held word is delivered");
+    words.extend(emitted(Some(checkpoint.clone())));
+    assert_eq!(words, ["hello", "there"]);
+    let segment_id = checkpoint.segment_delta.unwrap().upserts[0].id.clone();
+
+    // Replay: "there" again with 30 ms of jitter, then new speech.
+    assert!(emitted(engine.process(&final_at("there", 0.43, 0.92))).is_empty());
+    words.extend(emitted(engine.process(&final_at("friend", 0.92, 1.3))));
+    let flushed = engine.flush().expect("flush delivers the held word");
+    words.extend(emitted(Some(flushed.clone())));
+    assert_eq!(words, ["hello", "there", "friend"]);
+
+    let segment_delta = flushed.segment_delta.unwrap();
+    assert_eq!(
+        segment_delta.upserts.len(),
+        1,
+        "the speaker's turn stays one segment"
+    );
+    assert_eq!(segment_delta.upserts[0].text, "hello there friend");
+    assert_eq!(
+        segment_delta.removed_ids,
+        [segment_id],
+        "the segment grows instead of a second one starting at the reconnect"
+    );
+}
+
+#[test]
+fn updating_attendance_does_not_merge_remote_voices() {
+    let mut engine = LiveTranscriptEngine::new("deepgram", &[], Some("self"));
+    engine.update_identities(&["remote".into()], Some("self"), vec![], false, 0);
+    let mut spoken = word("hello", 0.0, 0.5);
+    spoken.speaker = Some(7);
+    let response = transcript_response_at("hello", vec![spoken], true, 1, 0.0, 0.5);
+    engine.process(&response);
+    let update = engine.flush().unwrap();
+    assert_eq!(update.transcript_delta.new_words[0].speaker_index, Some(7));
+    assert_eq!(
+        update.segment_delta.unwrap().upserts[0].key.speaker_index,
+        Some(7)
+    );
+}
+
+#[test]
+fn speaker_assignment_names_later_segments_from_the_same_speaker() {
+    let participants = ["self".to_string(), "artem".to_string(), "guest".to_string()];
+    let mut engine = LiveTranscriptEngine::new("deepgram", &participants, Some("self"));
+    let spoken = |text: &str, start: f64, speaker: i32| {
+        let mut words = words_from_text(text, start, 1.0);
+        for word in &mut words {
+            word.speaker = Some(speaker);
+        }
+        transcript_response_at(text, words, true, 1, start, 1.0)
+    };
+
+    let first = engine
+        .process(&spoken("ah okay it is this week", 0.0, 0))
+        .expect("first update");
+    let first_segments = first.segment_delta.expect("first segments").upserts;
+    assert_eq!(first_segments.len(), 1);
+    assert_eq!(first_segments[0].key.speaker_index, Some(0));
+    assert_eq!(first_segments[0].key.speaker_human_id, None);
+
+    let relabeled = engine
+        .update_identities(
+            &participants,
+            Some("self"),
+            vec![IdentityAssignment {
+                human_id: "artem".to_string(),
+                scope: anlg_transcript::IdentityScope::ChannelSpeaker {
+                    channel: anlg_transcript::ChannelProfile::RemoteParty,
+                    speaker_index: 0,
+                },
+            }],
+            false,
+            0,
+        )
+        .expect("assignment relabels the segment already on screen");
+    assert_eq!(relabeled.upserts.len(), 1);
+    assert_eq!(
+        relabeled.upserts[0].key.speaker_human_id.as_deref(),
+        Some("artem")
+    );
+    assert_eq!(relabeled.removed_ids, vec![first_segments[0].id.clone()]);
+
+    let later = engine
+        .process(&spoken("yeah let us discuss it", 10.0, 0))
+        .expect("later update");
+    let later_segments = later.segment_delta.expect("later segments").upserts;
+    assert_eq!(later_segments.len(), 1);
+    assert_eq!(
+        later_segments[0].key.speaker_human_id.as_deref(),
+        Some("artem")
+    );
+    assert!(later_segments[0].text.ends_with("yeah let us discuss it"));
+
+    // The processor holds the newest words as partials until the stream moves
+    // on, so flush to settle the other speaker's turn.
+    engine
+        .process(&spoken("nice", 20.0, 1))
+        .expect("other speaker update");
+    let settled = engine.flush().expect("flush update");
+    let settled_segments = settled.segment_delta.expect("settled segments").upserts;
+    let other = settled_segments
+        .iter()
+        .find(|segment| segment.text == "nice")
+        .expect("the other speaker gets a segment of their own");
+    assert_eq!(other.key.speaker_index, Some(1));
+    assert_eq!(other.key.speaker_human_id, None);
+    assert!(
+        settled_segments
+            .iter()
+            .filter(|segment| segment.key.speaker_human_id.as_deref() == Some("artem"))
+            .all(|segment| !segment.text.contains("nice"))
+    );
+}
+
+#[test]
+fn isolated_mic_names_indexless_words_as_self() {
+    let participants = ["self".to_string()];
+    let mut engine = LiveTranscriptEngine::with_speaker_assignments(
+        "deepgram",
+        &participants,
+        Some("self"),
+        vec![],
+        true,
+        0,
+    );
+
+    let update = engine
+        .process(&transcript_response_at(
+            "hello there",
+            words_from_text("hello there", 0.0, 1.0),
+            true,
+            0,
+            0.0,
+            1.0,
+        ))
+        .expect("update");
+    let segments = update.segment_delta.expect("segments").upserts;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].key.speaker_human_id.as_deref(), Some("self"));
+}
+
+#[test]
+fn shared_mic_keeps_indexless_words_anonymous() {
+    let participants = ["self".to_string()];
+    let mut engine = LiveTranscriptEngine::with_speaker_assignments(
+        "deepgram",
+        &participants,
+        Some("self"),
+        vec![],
+        false,
+        0,
+    );
+
+    let update = engine
+        .process(&transcript_response_at(
+            "hello there",
+            words_from_text("hello there", 0.0, 1.0),
+            true,
+            0,
+            0.0,
+            1.0,
+        ))
+        .expect("update");
+    let segments = update.segment_delta.expect("segments").upserts;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].key.speaker_human_id, None);
+}
+
+#[test]
+fn isolation_start_keeps_earlier_words_anonymous() {
+    let participants = ["self".to_string()];
+    let mut engine = LiveTranscriptEngine::with_speaker_assignments(
+        "deepgram",
+        &participants,
+        Some("self"),
+        vec![],
+        false,
+        0,
+    );
+
+    engine
+        .process(&transcript_response_at(
+            "guest speaks",
+            words_from_text("guest speaks", 0.0, 1.0),
+            true,
+            0,
+            0.0,
+            1.0,
+        ))
+        .expect("shared-era update");
+
+    if let Some(delta) = engine.update_identities(&participants, Some("self"), vec![], true, 2000) {
+        assert!(
+            delta
+                .upserts
+                .iter()
+                .filter(|segment| segment.text.contains("guest speaks"))
+                .all(|segment| segment.key.speaker_human_id.is_none()),
+            "shared-era words must not inherit the owner when isolation starts"
+        );
+    }
+
+    let update = engine
+        .process(&transcript_response_at(
+            "owner speaks",
+            words_from_text("owner speaks", 3.0, 1.0),
+            true,
+            0,
+            3.0,
+            1.0,
+        ))
+        .expect("isolated-era update");
+    let segments = update.segment_delta.expect("segments").upserts;
+    let owner = segments
+        .iter()
+        .find(|segment| segment.text.contains("owner speaks"))
+        .expect("isolated-era segment");
+    assert_eq!(owner.key.speaker_human_id.as_deref(), Some("self"));
+}
+
+#[test]
+fn isolation_end_keeps_earlier_isolated_words_named() {
+    let participants = ["self".to_string()];
+    let mut engine = LiveTranscriptEngine::with_speaker_assignments(
+        "deepgram",
+        &participants,
+        Some("self"),
+        vec![],
+        true,
+        0,
+    );
+
+    engine
+        .process(&transcript_response_at(
+            "owner speaks",
+            words_from_text("owner speaks", 0.0, 1.0),
+            true,
+            0,
+            0.0,
+            1.0,
+        ))
+        .expect("isolated-era update");
+
+    if let Some(delta) = engine.update_identities(&participants, Some("self"), vec![], false, 2000)
+    {
+        assert!(
+            delta
+                .upserts
+                .iter()
+                .filter(|segment| segment.text.contains("owner speaks"))
+                .all(|segment| segment.key.speaker_human_id.as_deref() == Some("self")),
+            "isolated-era words keep the owner after isolation ends"
+        );
+    }
+
+    let update = engine
+        .process(&transcript_response_at(
+            "guest speaks",
+            words_from_text("guest speaks", 3.0, 1.0),
+            true,
+            0,
+            3.0,
+            1.0,
+        ))
+        .expect("shared-era update");
+    let segments = update.segment_delta.expect("segments").upserts;
+    let guest = segments
+        .iter()
+        .find(|segment| segment.text.contains("guest speaks"))
+        .expect("shared-era segment");
+    assert_eq!(guest.key.speaker_human_id, None);
+}
+
+#[test]
+fn isolated_mic_self_wins_over_scoped_guest_assignment() {
+    let participants = ["self".to_string()];
+    let mut engine = LiveTranscriptEngine::with_speaker_assignments(
+        "deepgram",
+        &participants,
+        Some("self"),
+        vec![IdentityAssignment {
+            human_id: "guest".to_string(),
+            scope: anlg_transcript::IdentityScope::ChannelSpeaker {
+                channel: anlg_transcript::ChannelProfile::DirectMic,
+                speaker_index: 0,
+            },
+        }],
+        true,
+        0,
+    );
+
+    let update = engine
+        .process(&transcript_response_at(
+            "hello there",
+            words_from_text("hello there", 0.0, 1.0),
+            true,
+            0,
+            0.0,
+            1.0,
+        ))
+        .expect("update");
+    let segments = update.segment_delta.expect("segments").upserts;
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].key.speaker_human_id.as_deref(), Some("self"));
+}
+
+#[test]
+fn live_transcript_delta_keeps_speaker_index_on_words() {
+    let delta = TranscriptDelta {
+        new_words: vec![FinalizedWord {
+            id: "word-1".to_string(),
+            text: "hello".to_string(),
+            start_ms: 0,
+            end_ms: 100,
+            channel: 0,
+            state: anlg_transcript::WordState::Final,
+            speaker_index: Some(1),
+        }],
+        replaced_ids: vec!["replaced".to_string()],
+        partials: vec![PartialWord {
+            text: "world".to_string(),
+            start_ms: 100,
+            end_ms: 200,
+            channel: 1,
+            speaker_index: Some(2),
+        }],
+    };
+
+    let converted: LiveTranscriptDelta = delta.into();
+    assert_eq!(converted.new_words[0].speaker_index, Some(1));
+    assert_eq!(converted.partials[0].speaker_index, Some(2));
+    assert_eq!(converted.replaced_ids, vec!["replaced"]);
+}
+
+#[test]
+fn nari_completed_utterances_finalize_immediately_without_waiting_for_flush() {
+    let mut engine = LiveTranscriptEngine::new("nari", &[], None);
+    for (start, text) in [(0.0, "First answer"), (1.0, "Second answer")] {
+        let preview = transcript_response_at(
+            "provisional",
+            vec![word("provisional", start, start + 1.0)],
+            false,
+            0,
+            start,
+            1.0,
+        );
+        assert!(
+            engine
+                .process(&preview)
+                .unwrap()
+                .transcript_delta
+                .new_words
+                .is_empty()
+        );
+        let completed = transcript_response_at(
+            text,
+            vec![word(text, start, start + 1.0)],
+            true,
+            0,
+            start,
+            1.0,
+        );
+        let update = engine
+            .process(&completed)
+            .expect("completed utterance delta");
+        assert_eq!(update.transcript_delta.new_words.len(), 1);
+        assert_eq!(update.transcript_delta.new_words[0].text.trim(), text);
+        assert!(update.transcript_delta.partials.is_empty());
+        assert!(engine.process(&completed).is_none());
+    }
+    assert!(engine.flush().is_none());
+}
+
+#[test]
+fn nari_empty_final_clears_only_its_preview_and_never_persists_unconfirmed_text() {
+    let mut engine = LiveTranscriptEngine::new("nari", &[], None);
+    let first = transcript_response_at(
+        "discard this",
+        vec![word("discard this", 0.0, 1.0)],
+        false,
+        0,
+        0.0,
+        1.0,
+    );
+    engine.process(&first).unwrap();
+    let second = transcript_response_at(
+        "still pending",
+        vec![word("still pending", 2.0, 3.0)],
+        false,
+        0,
+        2.0,
+        1.0,
+    );
+    engine.process(&second).unwrap();
+    let empty = transcript_response_at("", vec![], true, 0, 0.0, 1.0);
+    let update = engine.process(&empty).unwrap();
+    assert!(update.transcript_delta.new_words.is_empty());
+    assert_eq!(update.transcript_delta.partials.len(), 1);
+    assert_eq!(update.transcript_delta.partials[0].text, "still pending");
+    let flushed = engine.flush();
+    assert!(flushed.is_none_or(|update| update.transcript_delta.new_words.is_empty()));
+}

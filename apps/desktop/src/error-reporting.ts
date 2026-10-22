@@ -1,0 +1,386 @@
+import * as Sentry from "@sentry/react";
+import type { ErrorEvent, SeverityLevel } from "@sentry/react";
+import { emit, listen } from "@tauri-apps/api/event";
+
+import { isUserError, isUserErrorEvent } from "@anlg/user-error";
+
+import { env } from "./env";
+import { commands as desktopCommands } from "./types/tauri.gen";
+
+type ErrorContextValue = null | boolean | number | string;
+const SAFE_IDENTIFIER_RE = /^[a-zA-Z0-9_.:/-]{1,128}$/;
+const SAFE_STACK_FUNCTION_RE = /^[a-zA-Z0-9_$.[\]<>-]{1,128}$/;
+const ERROR_REPORTING_CONSENT_EVENT = "anlg:error-reporting-consent-changed";
+let errorReportingEnabled = false;
+let sessionReplayAnalyticsEnabled = false;
+let errorReportingConsentRevision = 0;
+
+// Archived Sentry issue types. Local error logs stay; Sentry should not reopen
+// or bill for issues that were already solved. Keep in sync with
+// `IGNORED_ERROR_MARKERS` in crates/user-error/src/lib.rs.
+const IGNORED_ERROR_MARKERS = [
+  "[runbatch]",
+  "post-stop transcript repair failed",
+  "[audio-retention]",
+  "batch transcription failed",
+  "connect_async_failed",
+  "acquired connection, but time to acquire exceeded",
+  "slow statement",
+  "samples_dropped",
+  "mic_samples_dropped",
+  "zoom_mic_usage_check_failed",
+  "e2ee recovery key setup is required",
+  "couldn't find callback id",
+  "[sessionpersister]",
+  "update_check_failed",
+  "failed to check for updates",
+  "failed_to_check_for_updates",
+  "listen_ws_connect_failed",
+  "listener_retry_failed",
+  "failed to fetch remote connection ids",
+];
+
+function serializeForUserErrorMatch(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) {
+    return `${value.name}: ${value.message} ${serializeForUserErrorMatch({ ...value })}`;
+  }
+
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function textMatchesMarkers(value: unknown, markers: readonly string[]) {
+  const text = serializeForUserErrorMatch(value).toLowerCase();
+  return markers.some((marker) => text.includes(marker));
+}
+
+function isIgnoredError(value: unknown): boolean {
+  const text = serializeForUserErrorMatch(value);
+  return (
+    text.startsWith("[String(") ||
+    text.startsWith("[Object {") ||
+    textMatchesMarkers(text, IGNORED_ERROR_MARKERS)
+  );
+}
+
+// Breadcrumbs are deliberately excluded: they outlive the failure that produced
+// them and would suppress later, unrelated errors.
+function isDroppedErrorEvent(event: ErrorEvent): boolean {
+  const logger = typeof event.logger === "string" ? event.logger : undefined;
+  if (
+    logger &&
+    (logger.startsWith("tauri_plugin_tracing") ||
+      logger === "anarlog.webview.console" ||
+      logger === "hyprnote.webview.console")
+  ) {
+    return true;
+  }
+
+  return (
+    isUserErrorEvent(event) ||
+    [event.message, event.logentry, event.exception, event.extra].some(
+      isIgnoredError,
+    )
+  );
+}
+
+function safeIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_IDENTIFIER_RE.test(value)
+    ? value
+    : undefined;
+}
+
+function safeStackFunction(value: unknown): string | undefined {
+  return typeof value === "string" && SAFE_STACK_FUNCTION_RE.test(value)
+    ? value
+    : undefined;
+}
+
+export function operationalErrorMetadata(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return { type: "Error" };
+  }
+
+  const record = error as Record<string, unknown>;
+  const statusValue = record.status ?? record.statusCode;
+  const status =
+    typeof statusValue === "number" &&
+    Number.isInteger(statusValue) &&
+    statusValue >= 100 &&
+    statusValue <= 599
+      ? statusValue
+      : undefined;
+
+  return {
+    type: safeIdentifier(record.name) ?? "Error",
+    code: safeIdentifier(record.code),
+    stage: safeIdentifier(record.stage),
+    status,
+  };
+}
+
+export function normalizeOperationalError(
+  error: unknown,
+  operation: string,
+): Error {
+  const normalized = new Error(`${operation} failed`);
+  const metadata = operationalErrorMetadata(error);
+  normalized.name = metadata.type;
+
+  return normalized;
+}
+
+const SAFE_TAGS = new Set([
+  "anarlog.error.stage",
+  "anarlog.operation",
+  "anarlog.surface",
+  "error.code",
+  "error.type",
+  "http.response.status_code",
+  "service.name",
+  "service.namespace",
+]);
+
+type ErrorException = NonNullable<
+  NonNullable<ErrorEvent["exception"]>["values"]
+>[number];
+type ErrorStacktrace = NonNullable<ErrorException["stacktrace"]>;
+
+function sanitizeStacktrace(stacktrace: ErrorStacktrace) {
+  stacktrace.frames = stacktrace.frames?.map((frame) => ({
+    colno: frame.colno,
+    filename: "source",
+    function: safeStackFunction(frame.function),
+    in_app: frame.in_app,
+    lineno: frame.lineno,
+  }));
+  return stacktrace;
+}
+
+export function sanitizeErrorEvent(event: ErrorEvent): ErrorEvent | null {
+  if (isDroppedErrorEvent(event)) return null;
+
+  delete event.user;
+  delete event.request;
+  delete event.contexts;
+  delete event.extra;
+  delete event.message;
+  delete event.logentry;
+  delete event.transaction;
+  event.tags = Object.fromEntries(
+    Object.entries(event.tags ?? {}).filter(
+      ([key, value]) =>
+        SAFE_TAGS.has(key) &&
+        (typeof value === "number" || safeIdentifier(value) !== undefined),
+    ),
+  );
+  if (event.exception?.values) {
+    event.exception.values = event.exception.values.map((exception) => {
+      const sanitized = {
+        ...exception,
+        value: exception.type ? `${exception.type} captured` : "Error captured",
+      };
+      delete sanitized.module;
+      if (sanitized.stacktrace) {
+        sanitized.stacktrace = sanitizeStacktrace(sanitized.stacktrace);
+      }
+      if (sanitized.mechanism) {
+        const original = sanitized.mechanism;
+        sanitized.mechanism = {
+          type: safeIdentifier(original.type) ?? "generic",
+          ...(original.handled === undefined
+            ? {}
+            : { handled: original.handled }),
+          ...(original.synthetic === undefined
+            ? {}
+            : { synthetic: original.synthetic }),
+        };
+      }
+      return sanitized;
+    });
+  }
+  event.breadcrumbs = event.breadcrumbs?.map((breadcrumb) => ({
+    category: breadcrumb.category,
+    level: breadcrumb.level,
+    timestamp: breadcrumb.timestamp,
+    type: breadcrumb.type,
+  }));
+
+  return event;
+}
+
+export function initializeErrorReporting() {
+  if (!env.VITE_SENTRY_DSN) return;
+
+  Sentry.init({
+    dsn: env.VITE_SENTRY_DSN,
+    release: env.VITE_APP_VERSION
+      ? `anarlog-desktop@${env.VITE_APP_VERSION}`
+      : undefined,
+    environment: import.meta.env.MODE,
+    sendDefaultPii: false,
+    tracePropagationTargets: [],
+    beforeSend: (event) =>
+      errorReportingEnabled ? sanitizeErrorEvent(event) : null,
+    replaysSessionSampleRate: 0.1,
+    replaysOnErrorSampleRate: 1.0,
+    initialScope: {
+      tags: {
+        "service.name": "desktop",
+        "service.namespace": "anarlog",
+        "anarlog.surface": "desktop",
+      },
+    },
+  });
+
+  void initializeErrorReportingConsent();
+}
+
+let sessionReplayInstalled = false;
+let sessionReplayRunning = false;
+
+async function initializeErrorReportingConsent() {
+  try {
+    await listen<{ enabled: boolean }>(
+      ERROR_REPORTING_CONSENT_EVENT,
+      ({ payload }) => {
+        errorReportingConsentRevision += 1;
+        applyErrorReportingConsent(payload.enabled);
+      },
+    );
+    const consentRevision = errorReportingConsentRevision;
+    const enabled = await desktopCommands.isCrashReportingEnabled();
+    if (
+      enabled.status === "ok" &&
+      consentRevision === errorReportingConsentRevision
+    ) {
+      applyErrorReportingConsent(enabled.data);
+    }
+  } catch {
+    // Without a readable consent state, keep error reporting off.
+  }
+}
+
+function applyErrorReportingConsent(enabled: boolean) {
+  errorReportingEnabled = enabled;
+  Sentry.getCurrentScope().clearBreadcrumbs();
+
+  if (enabled && sessionReplayAnalyticsEnabled) {
+    startSessionReplay();
+  } else {
+    stopSessionReplay();
+  }
+}
+
+export function setSessionReplayAnalyticsEnabled(enabled: boolean) {
+  sessionReplayAnalyticsEnabled = enabled;
+  applyErrorReportingConsent(errorReportingEnabled);
+}
+
+function startSessionReplay() {
+  if (sessionReplayRunning) return;
+
+  if (sessionReplayInstalled) {
+    Sentry.getReplay()?.start();
+    sessionReplayRunning = true;
+    return;
+  }
+
+  Sentry.addIntegration(
+    Sentry.replayIntegration({
+      blockAllMedia: true,
+      maskAllText: true,
+    }),
+  );
+  sessionReplayInstalled = true;
+  sessionReplayRunning = true;
+}
+
+function stopSessionReplay() {
+  if (!sessionReplayRunning) return;
+
+  sessionReplayRunning = false;
+  const replay = Sentry.getClient()?.getIntegrationByName?.("Replay") as
+    | {
+        _replay?: {
+          stop?: (options: {
+            forceFlush: boolean;
+            reason: string;
+          }) => Promise<void>;
+        };
+      }
+    | undefined;
+  // The public stop() force-flushes session recordings, so consent revocation
+  // must stop the internal controller without sending its buffered segment.
+  void replay?._replay
+    ?.stop?.({ forceFlush: false, reason: "consent_revoked" })
+    .catch(() => {});
+}
+
+export async function setErrorReportingEnabled(enabled: boolean) {
+  const result = await desktopCommands.setCrashReportingEnabled(enabled);
+  if (result.status === "error") {
+    throw new Error(result.error);
+  }
+
+  errorReportingConsentRevision += 1;
+  applyErrorReportingConsent(enabled);
+  await emit(ERROR_REPORTING_CONSENT_EVENT, { enabled });
+}
+
+export function reportCaughtReactError(error: unknown) {
+  if (isUserError(error) || isIgnoredError(error)) return;
+  Sentry.captureException(error, {
+    tags: { "anarlog.operation": "react_error_boundary" },
+  });
+}
+
+export function captureOperationalError(
+  error: unknown,
+  {
+    operation,
+    level = "error",
+    tags,
+    context,
+  }: {
+    operation: string;
+    level?: SeverityLevel;
+    tags?: Record<string, ErrorContextValue>;
+    context?: Record<string, ErrorContextValue>;
+  },
+) {
+  if (isUserError(error) || isIgnoredError(error)) return;
+
+  const metadata = operationalErrorMetadata(error);
+  const exception = normalizeOperationalError(error, operation);
+
+  return Sentry.withScope((scope) => {
+    scope.setLevel(level);
+    scope.setTag("anarlog.operation", operation);
+    scope.setTag("error.type", metadata.type);
+    if (metadata.code) scope.setTag("error.code", metadata.code);
+    if (metadata.stage) {
+      scope.setTag("anarlog.error.stage", metadata.stage);
+    }
+    if (metadata.status) {
+      scope.setTag("http.response.status_code", metadata.status);
+    }
+    for (const [key, value] of Object.entries(tags ?? {})) {
+      if (value !== null) {
+        scope.setTag(`anarlog.${key}`, value);
+      }
+    }
+    if (context) {
+      scope.setContext("anarlog.operation", context);
+    }
+    return Sentry.captureException(exception);
+  });
+}
+
+export function setErrorReportingUser(_userId: string | null) {
+  Sentry.setUser(null);
+}

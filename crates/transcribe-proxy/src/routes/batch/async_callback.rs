@@ -1,0 +1,356 @@
+use anlg_api_auth::AuthContext;
+use axum::{
+    Json,
+    body::{Body, Bytes},
+};
+use owhisper_client::{CallbackSttAdapter, DeepgramAdapter, Provider, SonioxAdapter};
+use owhisper_interface::ListenParams;
+use serde::{Deserialize, Serialize};
+
+use crate::query_params::QueryParams;
+use crate::supabase::{PipelineStatus, SupabaseClient, TranscriptionJob, user_owns_object_path};
+
+use super::super::{AppState, MAX_BATCH_AUDIO_BODY_BYTES, RouteError, parse_async_provider};
+use super::BatchAudioWriteError;
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct ListenCallbackRequest {
+    pub url: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ListenCallbackResponse {
+    pub request_id: String,
+}
+
+pub(super) async fn handle_callback(
+    state: &AppState,
+    auth: Option<axum::Extension<AuthContext>>,
+    params: &mut QueryParams,
+    body: Bytes,
+) -> Result<Json<ListenCallbackResponse>, RouteError> {
+    let auth = auth.ok_or(RouteError::Unauthorized("authentication required"))?;
+    let user_id = auth.claims.sub.clone();
+
+    let supabase = build_supabase_client(state)?;
+
+    let provider_str = params
+        .remove_first("provider")
+        .unwrap_or_else(|| "deepgram".to_string());
+    let provider = parse_async_provider(&provider_str)?;
+    let listen_params = super::build_listen_params(params);
+
+    let id = uuid::Uuid::new_v4().to_string();
+
+    let req: ListenCallbackRequest = serde_json::from_slice(&body)
+        .map_err(|_| RouteError::BadRequest("expected JSON body with url field".into()))?;
+    let file_id = req.url;
+    if !user_owns_object_path(&user_id, &file_id) {
+        return Err(RouteError::BadRequest(
+            "audio object must belong to the authenticated user".into(),
+        ));
+    }
+
+    let audio_url = supabase
+        .storage()
+        .create_signed_url("audio-files", &file_id, 3600)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                error.type = "storage_signed_url_failed",
+                "failed to create signed URL"
+            );
+            let _ = e;
+            RouteError::Internal("failed to create signed URL".into())
+        })?;
+
+    let is_local =
+        audio_url.starts_with("http://127.0.0.1") || audio_url.starts_with("http://localhost");
+
+    let job = TranscriptionJob {
+        id: id.clone(),
+        user_id,
+        file_id: file_id.clone(),
+        provider: provider_str.to_string(),
+        status: PipelineStatus::Processing,
+        provider_request_id: None,
+        raw_result: None,
+        error: None,
+    };
+    supabase.insert_job(&job).await.map_err(|_| {
+        tracing::error!(error.type = "job_insert_failed", "failed to insert job");
+        RouteError::Internal("failed to record job".to_string())
+    })?;
+
+    let outcome = if is_local {
+        handle_sync_fallback(
+            state,
+            &provider_str,
+            provider,
+            &listen_params,
+            &audio_url,
+            &file_id,
+        )
+        .await
+    } else {
+        handle_remote_callback(state, &provider_str, provider, &audio_url, &id)
+            .await
+            .map(|provider_request_id| {
+                (
+                    PipelineStatus::Processing,
+                    Some(provider_request_id),
+                    None,
+                    None,
+                )
+            })
+    };
+
+    let (status, provider_request_id, raw_result, error) = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = supabase
+                .update_job(
+                    &id,
+                    &crate::supabase::JobUpdate {
+                        status: PipelineStatus::Error,
+                        provider_request_id: None,
+                        raw_result: None,
+                        error: Some("transcription setup failed".to_string()),
+                    },
+                )
+                .await;
+            return Err(error);
+        }
+    };
+
+    supabase
+        .update_job(
+            &id,
+            &crate::supabase::JobUpdate {
+                status,
+                provider_request_id,
+                raw_result,
+                error,
+            },
+        )
+        .await
+        .map_err(|_| {
+            tracing::error!(error.type = "job_update_failed", "failed to update job");
+            RouteError::Internal("failed to update job".to_string())
+        })?;
+
+    Ok(Json(ListenCallbackResponse { request_id: id }))
+}
+
+async fn handle_sync_fallback(
+    state: &AppState,
+    provider_str: &str,
+    provider: Provider,
+    listen_params: &ListenParams,
+    audio_url: &str,
+    file_id: &str,
+) -> Result<
+    (
+        PipelineStatus,
+        Option<String>,
+        Option<serde_json::Value>,
+        Option<String>,
+    ),
+    RouteError,
+> {
+    let _batch_slot = state.try_acquire_batch_slot()?;
+
+    tracing::info!(
+        anarlog.stt.provider.name = %provider_str,
+        "local_url_detected, using sync transcription"
+    );
+
+    let download_response =
+        anlg_observability::with_current_trace_context(state.client.get(audio_url))
+            .send()
+            .await
+            .map_err(|_| RouteError::Internal("failed to download audio".into()))?;
+
+    let download_status = download_response.status();
+    if !download_status.is_success() {
+        tracing::error!(
+            http.response.status_code = %download_status.as_u16(),
+            anarlog.audio.size_bytes = download_response.content_length().unwrap_or_default(),
+            "signed_url_download_failed"
+        );
+        return Err(RouteError::Internal(format!(
+            "failed to download audio from storage: {download_status}"
+        )));
+    }
+
+    let content_type = content_type_from_filename(file_id);
+    if download_response
+        .content_length()
+        .is_some_and(|len| len > MAX_BATCH_AUDIO_BODY_BYTES as u64)
+    {
+        return Err(RouteError::BadRequest(format!(
+            "downloaded audio exceeds {MAX_BATCH_AUDIO_BODY_BYTES} bytes"
+        )));
+    }
+    let audio_file = super::write_body_to_temp_file(
+        Body::from_stream(download_response.bytes_stream()),
+        content_type,
+    )
+    .await
+    .map_err(callback_download_write_error)?;
+
+    if audio_file.len() < 1024 {
+        tracing::error!(
+            http.response.status_code = %download_status.as_u16(),
+            anarlog.audio.size_bytes = audio_file.len(),
+            "signed_url_download_failed"
+        );
+    }
+
+    tracing::info!(
+        anarlog.file.mime_type = %content_type,
+        anarlog.audio.size_bytes = audio_file.len(),
+        "sync_fallback_audio_downloaded"
+    );
+
+    let selected = state
+        .config
+        .provider_selector()
+        .select(Some(provider))
+        .map_err(|_| RouteError::MissingConfig("api_key not configured for provider"))?;
+
+    match super::sync::transcribe_with_provider(&selected, listen_params.clone(), audio_file.path())
+        .await
+    {
+        Ok(response) => {
+            let raw_result = serde_json::to_value(&response)
+                .map_err(|e| RouteError::Internal(format!("failed to serialize result: {e}")))?;
+            Ok((PipelineStatus::Done, None, Some(raw_result), None))
+        }
+        Err(e) => {
+            if e.is_user_error() {
+                tracing::warn!(
+                    error.type = %e.kind(),
+                    anarlog.stt.provider.name = %provider_str,
+                    "sync transcription rejected"
+                );
+            } else {
+                tracing::error!(
+                    error.type = %e.kind(),
+                    anarlog.stt.provider.name = %provider_str,
+                    "sync transcription failed"
+                );
+            }
+            Ok((
+                PipelineStatus::Error,
+                None,
+                None,
+                Some(e.message().to_string()),
+            ))
+        }
+    }
+}
+
+fn callback_download_write_error(error: BatchAudioWriteError) -> RouteError {
+    match error {
+        BatchAudioWriteError::TooLarge => RouteError::BadRequest(format!(
+            "downloaded audio exceeds {MAX_BATCH_AUDIO_BODY_BYTES} bytes"
+        )),
+        BatchAudioWriteError::Body(_) => {
+            RouteError::Internal("failed to download audio body".into())
+        }
+        BatchAudioWriteError::Io(_) => {
+            RouteError::Internal("failed to store downloaded audio".into())
+        }
+    }
+}
+
+async fn handle_remote_callback(
+    state: &AppState,
+    provider_str: &str,
+    provider: Provider,
+    audio_url: &str,
+    id: &str,
+) -> Result<String, RouteError> {
+    let api_base_url = state
+        .config
+        .callback
+        .api_base_url
+        .as_deref()
+        .ok_or(RouteError::MissingConfig("api_base_url not configured"))?
+        .trim_end_matches('/');
+
+    let callback_secret = state
+        .config
+        .callback
+        .secret
+        .as_deref()
+        .ok_or(RouteError::MissingConfig("callback_secret not configured"))?;
+
+    let callback_url =
+        format!("{api_base_url}/stt/callback/{provider_str}/{id}?secret={callback_secret}");
+
+    let api_key = state
+        .config
+        .api_keys
+        .get(&provider)
+        .ok_or(RouteError::MissingConfig(
+            "api_key not configured for provider",
+        ))?;
+
+    match provider {
+        Provider::Soniox => {
+            SonioxAdapter
+                .submit_callback(&state.client, api_key, audio_url, &callback_url)
+                .await
+        }
+        Provider::Deepgram => {
+            DeepgramAdapter
+                .submit_callback(&state.client, api_key, audio_url, &callback_url)
+                .await
+        }
+        _ => unreachable!(),
+    }
+    .map_err(|e| {
+        tracing::error!(
+            error.type = "provider_submission_failed",
+            anarlog.stt.provider.name = %provider_str,
+            "submission failed"
+        );
+        let _ = e;
+        RouteError::BadGateway(format!("{provider_str} submission failed"))
+    })
+}
+
+fn content_type_from_filename(file_id: &str) -> &'static str {
+    let ext = file_id.rsplit('.').next().unwrap_or("");
+    match ext {
+        "wav" | "wave" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "flac" => "audio/flac",
+        "m4a" | "mp4" => "audio/mp4",
+        "webm" => "audio/webm",
+        "aac" => "audio/aac",
+        _ => "application/octet-stream",
+    }
+}
+
+fn build_supabase_client(state: &AppState) -> Result<SupabaseClient, RouteError> {
+    let url = state
+        .config
+        .supabase
+        .url
+        .as_deref()
+        .ok_or(RouteError::MissingConfig("supabase_url not configured"))?;
+    let key =
+        state
+            .config
+            .supabase
+            .service_role_key
+            .as_deref()
+            .ok_or(RouteError::MissingConfig(
+                "supabase_service_role_key not configured",
+            ))?;
+    Ok(SupabaseClient::new(state.client.clone(), url, key))
+}

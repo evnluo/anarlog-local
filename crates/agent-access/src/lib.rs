@@ -1,0 +1,1438 @@
+#![forbid(unsafe_code)]
+
+mod proposals;
+mod recording_import;
+pub use recording_import::*;
+mod transcript_render;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use specta::Type;
+use sqlx::SqlitePool;
+
+pub use proposals::{
+    CreateProposalInput, DeclineProposalInput, GetProposalInput, ListProposalsInput, Proposal,
+    ProposalPage, create_proposal, decline_proposal, get_proposal, list_proposals,
+    proposal_unified_diff,
+};
+
+pub const DEFAULT_LIST_LIMIT: u32 = 20;
+pub const MAX_LIST_LIMIT: u32 = 200;
+pub const DEFAULT_TRANSCRIPT_LIMIT: u32 = 200;
+pub const MAX_TRANSCRIPT_LIMIT: u32 = 500;
+pub const DEFAULT_FOLDER_LIST_LIMIT: u32 = 100;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{0} not found")]
+    NotFound(String),
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{action} failed: {source}")]
+    Database {
+        action: &'static str,
+        #[source]
+        source: sqlx::Error,
+    },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct ListMeetingsInput {
+    #[schemars(description = "Case-insensitive title or meeting id substring")]
+    pub query: Option<String>,
+    #[schemars(description = "Exact recurring series id")]
+    pub series_id: Option<String>,
+    #[schemars(
+        description = "Folder path from list_folders, such as Projects/Launch; includes meetings in its subfolders"
+    )]
+    #[serde(default)]
+    pub folder_path: Option<String>,
+    #[schemars(description = "Maximum results; defaults to 20 and is capped at 200")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: Option<u32>,
+    #[schemars(description = "Number of results to skip; defaults to 0")]
+    pub offset: Option<u32>,
+}
+
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct ListFoldersInput {
+    #[schemars(description = "Case-insensitive folder path substring")]
+    pub query: Option<String>,
+    #[schemars(description = "Maximum results; defaults to 100 and is capped at 200")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: Option<u32>,
+    #[schemars(description = "Number of results to skip; defaults to 0")]
+    pub offset: Option<u32>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct GetMeetingInput {
+    #[schemars(description = "Anarlog meeting id")]
+    pub meeting_id: String,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct GetMeetingTranscriptInput {
+    #[schemars(description = "Anarlog meeting id")]
+    pub meeting_id: String,
+    #[schemars(description = "Word offset; defaults to 0")]
+    pub offset: Option<u32>,
+    #[schemars(description = "Maximum words; defaults to 200 and is capped at 500")]
+    #[schemars(range(min = 1, max = 500))]
+    pub limit: Option<u32>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct GetRecurringMeetingHistoryInput {
+    #[schemars(description = "A meeting id used to resolve its recurring series")]
+    pub meeting_id: String,
+    #[schemars(description = "Maximum meetings; defaults to 20 and is capped at 200")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: Option<u32>,
+    #[schemars(description = "Number of meetings to skip; defaults to 0")]
+    pub offset: Option<u32>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct Pagination {
+    pub offset: u32,
+    pub limit: u32,
+    pub returned: usize,
+    pub total: Option<usize>,
+    pub next_offset: Option<u32>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct MeetingListItem {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub series_id: String,
+    /// Folder path such as `Projects/Launch`; null when the meeting is not in a folder.
+    #[serde(default)]
+    pub folder_path: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct MeetingPage {
+    pub meetings: Vec<MeetingListItem>,
+    pub pagination: Pagination,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct Folder {
+    /// Slash-separated folder path used for filtering, such as `Projects/Launch`.
+    pub path: String,
+    /// Last path segment.
+    pub name: String,
+    /// Parent folder path; null for top-level folders.
+    pub parent_path: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct FolderPage {
+    pub folders: Vec<Folder>,
+    pub pagination: Pagination,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct TranscriptPage {
+    pub meeting_id: String,
+    pub text: String,
+    pub words: Vec<Value>,
+    pub pagination: Pagination,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct Document {
+    pub id: String,
+    pub kind: String,
+    pub template_id: String,
+    pub title: String,
+    pub markdown: String,
+    pub sort_order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct Participant {
+    pub human_id: String,
+    pub display_name: String,
+    pub email: String,
+    pub role: String,
+    pub job_title: String,
+    pub organization_id: String,
+    pub organization_name: String,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct ActionItem {
+    pub id: String,
+    pub assignee_human_id: String,
+    pub status: String,
+    pub text: String,
+    pub due_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct Meeting {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub timezone: String,
+    pub language: String,
+    pub series_id: String,
+    /// Folder path such as `Projects/Launch`; null when the meeting is not in a folder.
+    #[serde(default)]
+    pub folder_path: Option<String>,
+    pub note: Option<Document>,
+    pub summaries: Vec<Document>,
+    pub participants: Vec<Participant>,
+    pub action_items: Vec<ActionItem>,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    Type,
+    utoipa::ToSchema,
+    sqlx::FromRow,
+)]
+pub struct RecordingAttachment {
+    pub id: String,
+    pub relative_path: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct Transcript {
+    pub id: String,
+    pub source: String,
+    pub provider: String,
+    pub model: String,
+    pub language: String,
+    pub started_at_ms: i64,
+    pub ended_at_ms: Option<i64>,
+    pub memo: String,
+    pub text: String,
+    pub words: Vec<Value>,
+    pub speaker_hints: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct MeetingExport {
+    #[serde(flatten)]
+    pub meeting: Meeting,
+    pub transcripts: Vec<Transcript>,
+    /// People referenced by transcript speaker assignments (including the
+    /// recording user) who may not appear among the meeting participants.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speakers: Vec<Speaker>,
+    /// Recorded microphone/call context intervals (`sessions.metadata_json`
+    /// `speaker_context`) used to label speakers the same way the desktop
+    /// transcript view does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_context: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, Type, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct Speaker {
+    pub human_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_self: bool,
+}
+
+pub async fn list_meetings(pool: &SqlitePool, input: ListMeetingsInput) -> Result<MeetingPage> {
+    let limit = input
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let offset = input.offset.unwrap_or(0);
+    let folder_path = input
+        .folder_path
+        .as_deref()
+        .map(|path| {
+            normalize_folder_path(path)
+                .ok_or_else(|| Error::Invalid(format!("invalid folder path '{path}'")))
+        })
+        .transpose()?
+        .filter(|path| !path.is_empty());
+    let mut meetings = anlg_db_app::list_sessions(
+        pool,
+        anlg_db_app::ListSessions {
+            query: input.query.as_deref(),
+            series_id: input.series_id.as_deref(),
+            folder_path: folder_path.as_deref(),
+            limit: limit + 1,
+            offset,
+        },
+    )
+    .await
+    .map_err(|source| Error::Database {
+        action: "list meetings",
+        source,
+    })?;
+    let has_more = meetings.len() > limit as usize;
+    meetings.truncate(limit as usize);
+    let meetings = meetings
+        .into_iter()
+        .map(MeetingListItem::from)
+        .collect::<Vec<_>>();
+    let pagination = pagination(offset, limit, meetings.len(), None, has_more);
+
+    Ok(MeetingPage {
+        meetings,
+        pagination,
+    })
+}
+
+pub async fn list_folders(pool: &SqlitePool, input: ListFoldersInput) -> Result<FolderPage> {
+    let limit = input
+        .limit
+        .unwrap_or(DEFAULT_FOLDER_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let offset = input.offset.unwrap_or(0);
+    let needle = input
+        .query
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_lowercase();
+    let stored = anlg_db_app::list_folder_paths(pool)
+        .await
+        .map_err(|source| Error::Database {
+            action: "list folders",
+            source,
+        })?;
+    let mut paths = std::collections::BTreeSet::new();
+    for path in stored.iter().filter_map(|path| normalize_folder_path(path)) {
+        let mut end = 0;
+        for segment in path.split('/') {
+            end += segment.len();
+            paths.insert(path[..end].to_string());
+            end += 1;
+        }
+    }
+    let matching = paths
+        .into_iter()
+        .filter(|path| path.to_lowercase().contains(&needle))
+        .collect::<Vec<_>>();
+    let folders = matching
+        .iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .map(|path| Folder::from_path(path))
+        .collect::<Vec<_>>();
+    let has_more = (offset as usize).saturating_add(folders.len()) < matching.len();
+    let pagination = pagination(offset, limit, folders.len(), Some(matching.len()), has_more);
+
+    Ok(FolderPage {
+        folders,
+        pagination,
+    })
+}
+
+pub async fn get_meeting(pool: &SqlitePool, input: GetMeetingInput) -> Result<Meeting> {
+    let meeting_id = input.meeting_id;
+    let (session, note, documents, participants, action_items) = tokio::try_join!(
+        anlg_db_app::get_session(pool, &meeting_id),
+        anlg_db_app::get_session_note(pool, &meeting_id),
+        anlg_db_app::list_session_documents(pool, &meeting_id),
+        anlg_db_app::list_session_participants(pool, &meeting_id),
+        anlg_db_app::list_session_action_items(pool, &meeting_id),
+    )
+    .map_err(|source| Error::Database {
+        action: "load meeting",
+        source,
+    })?;
+
+    let session = session.ok_or_else(|| Error::NotFound(format!("meeting '{meeting_id}'")))?;
+    let summaries = documents
+        .into_iter()
+        .filter(|document| matches!(document.kind.as_str(), "summary" | "template_output"))
+        .map(Document::from)
+        .collect();
+
+    Ok(Meeting {
+        id: session.id,
+        title: session.title,
+        kind: session.kind,
+        status: session.status,
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+        started_at: session.started_at,
+        ended_at: session.ended_at,
+        timezone: session.timezone,
+        language: session.language,
+        series_id: session.series_id,
+        folder_path: stored_folder_path(session.folder_path),
+        note: note.map(Document::from),
+        summaries,
+        participants: participants.into_iter().map(Participant::from).collect(),
+        action_items: action_items.into_iter().map(ActionItem::from).collect(),
+    })
+}
+
+pub async fn get_meeting_transcript(
+    pool: &SqlitePool,
+    input: GetMeetingTranscriptInput,
+) -> Result<TranscriptPage> {
+    let exists = anlg_db_app::get_session(pool, &input.meeting_id)
+        .await
+        .map_err(|source| Error::Database {
+            action: "load meeting",
+            source,
+        })?
+        .is_some();
+    if !exists {
+        return Err(Error::NotFound(format!("meeting '{}'", input.meeting_id)));
+    }
+
+    let transcripts = load_transcripts(pool, &input.meeting_id).await?;
+    Ok(paginate_transcripts(
+        &input.meeting_id,
+        &transcripts,
+        input.offset.unwrap_or(0),
+        input
+            .limit
+            .unwrap_or(DEFAULT_TRANSCRIPT_LIMIT)
+            .clamp(1, MAX_TRANSCRIPT_LIMIT),
+    ))
+}
+
+pub async fn get_recurring_meeting_history(
+    pool: &SqlitePool,
+    input: GetRecurringMeetingHistoryInput,
+) -> Result<MeetingPage> {
+    let meeting = anlg_db_app::get_session(pool, &input.meeting_id)
+        .await
+        .map_err(|source| Error::Database {
+            action: "load meeting",
+            source,
+        })?
+        .ok_or_else(|| Error::NotFound(format!("meeting '{}'", input.meeting_id)))?;
+    let series_id = meeting.series_id.trim();
+    let limit = input
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let offset = input.offset.unwrap_or(0);
+    if series_id.is_empty() {
+        return Ok(MeetingPage {
+            meetings: Vec::new(),
+            pagination: pagination(offset, limit, 0, Some(0), false),
+        });
+    }
+
+    list_meetings(
+        pool,
+        ListMeetingsInput {
+            query: None,
+            series_id: Some(series_id.to_string()),
+            folder_path: None,
+            limit: Some(limit),
+            offset: Some(offset),
+        },
+    )
+    .await
+}
+
+/// Local-only capture metadata. Cloud/API/MCP meeting contracts do not expose
+/// filesystem paths or imported calendar bodies.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LocalMeetingExport {
+    #[serde(flatten)]
+    pub export: MeetingExport,
+    pub folder_path: String,
+    pub event_id: String,
+    pub external_event_id: String,
+    pub external_provider: String,
+    pub event_json: String,
+    pub attachments: Vec<RecordingAttachment>,
+    /// Pending capture/recovery excludes even an older, fully final transcript.
+    pub capture_pending: bool,
+}
+
+pub async fn get_local_meeting_export(
+    pool: &SqlitePool,
+    meeting_id: String,
+) -> Result<LocalMeetingExport> {
+    let export = get_meeting_export(pool, meeting_id.clone()).await?;
+    let session = anlg_db_app::get_session(pool, &meeting_id)
+        .await
+        .map_err(|source| Error::Database {
+            action: "load local meeting metadata",
+            source,
+        })?
+        .ok_or_else(|| Error::NotFound(meeting_id.clone()))?;
+    let attachments = sqlx::query_as::<_, RecordingAttachment>(
+        "SELECT a.id, COALESCE(l.relative_path,a.relative_path) relative_path,
+         a.filename,a.content_type,a.size_bytes,a.sha256 FROM session_attachments a
+         LEFT JOIN attachment_local_state l ON l.attachment_id=a.id
+         WHERE a.session_id=? AND a.deleted_at IS NULL ORDER BY a.id",
+    )
+    .bind(&meeting_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|source| Error::Database {
+        action: "load recording attachments",
+        source,
+    })?;
+    let capture_pending = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM app_settings WHERE
+            id IN (?, ?) OR substr(id, 1, length(?)) = ?)",
+    )
+    .bind(format!("capture_lifecycle_pending:{meeting_id}"))
+    .bind(format!("capture_audio_saved:{meeting_id}"))
+    .bind(format!("capture_incomplete:{meeting_id}:"))
+    .bind(format!("capture_incomplete:{meeting_id}:"))
+    .fetch_one(pool)
+    .await
+    .map_err(|source| Error::Database {
+        action: "load capture completion state",
+        source,
+    })?;
+    Ok(LocalMeetingExport {
+        export,
+        folder_path: session.folder_path,
+        event_id: session.event_id,
+        external_event_id: session.external_event_id,
+        external_provider: session.external_provider,
+        event_json: session.event_json,
+        attachments,
+        capture_pending,
+    })
+}
+
+pub async fn get_meeting_export(pool: &SqlitePool, meeting_id: String) -> Result<MeetingExport> {
+    let (meeting, transcript_rows, speaker_context) = tokio::try_join!(
+        get_meeting(
+            pool,
+            GetMeetingInput {
+                meeting_id: meeting_id.clone(),
+            }
+        ),
+        load_transcript_rows(pool, &meeting_id),
+        load_speaker_context(pool, &meeting_id),
+    )?;
+    let self_human_id = transcript_rows
+        .iter()
+        .map(|row| row.owner_user_id.trim())
+        .find(|id| !id.is_empty())
+        .map(str::to_string);
+    let transcripts = transcript_rows
+        .into_iter()
+        .map(Transcript::from)
+        .collect::<Vec<_>>();
+    let speakers = load_speakers(pool, &meeting, &transcripts, self_human_id).await?;
+    Ok(MeetingExport {
+        meeting,
+        transcripts,
+        speakers,
+        speaker_context,
+    })
+}
+
+async fn load_speaker_context(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Value>> {
+    let metadata_json: Option<String> =
+        sqlx::query_scalar("SELECT metadata_json FROM sessions WHERE id = ?")
+            .bind(meeting_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|source| Error::Database {
+                action: "load speaker context",
+                source,
+            })?;
+    Ok(metadata_json
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|mut metadata| match metadata.get_mut("speaker_context") {
+            Some(context) if context.is_object() => Some(context.take()),
+            _ => None,
+        }))
+}
+
+async fn load_speakers(
+    pool: &SqlitePool,
+    meeting: &Meeting,
+    transcripts: &[Transcript],
+    self_human_id: Option<String>,
+) -> Result<Vec<Speaker>> {
+    let mut human_ids = transcript_render::assigned_human_ids(transcripts);
+    if let Some(self_id) = &self_human_id
+        && !human_ids.contains(self_id)
+    {
+        human_ids.push(self_id.clone());
+    }
+    if human_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, name FROM humans WHERE deleted_at IS NULL AND id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for id in &human_ids {
+        separated.push_bind(id);
+    }
+    separated.push_unseparated(") ORDER BY id");
+    let names = query
+        .build_query_as::<(String, String)>()
+        .fetch_all(pool)
+        .await
+        .map_err(|source| Error::Database {
+            action: "load speakers",
+            source,
+        })?
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+
+    Ok(human_ids
+        .into_iter()
+        .map(|human_id| {
+            let name = names
+                .get(&human_id)
+                .cloned()
+                .or_else(|| {
+                    meeting
+                        .participants
+                        .iter()
+                        .find(|participant| participant.human_id == human_id)
+                        .map(|participant| participant.display_name.clone())
+                })
+                .unwrap_or_default();
+            Speaker {
+                is_self: self_human_id.as_deref() == Some(human_id.as_str()),
+                human_id,
+                name,
+            }
+        })
+        .collect())
+}
+
+impl Meeting {
+    pub fn to_markdown(&self) -> String {
+        let title = if self.title.trim().is_empty() {
+            "Untitled meeting"
+        } else {
+            self.title.trim()
+        };
+        let mut sections = vec![format!("# {title}"), self.metadata_markdown()];
+
+        if let Some(note) = &self.note {
+            push_section(&mut sections, "Notes", &note.markdown);
+        }
+        for summary in &self.summaries {
+            let heading = if summary.title.trim().is_empty() {
+                "Summary"
+            } else {
+                summary.title.trim()
+            };
+            push_section(&mut sections, heading, &summary.markdown);
+        }
+        if !self.action_items.is_empty() {
+            let body = self
+                .action_items
+                .iter()
+                .map(|item| {
+                    let checked = matches!(item.status.as_str(), "done" | "completed");
+                    format!("- [{}] {}", if checked { "x" } else { " " }, item.text)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            push_section(&mut sections, "Action items", &body);
+        }
+
+        sections.join("\n\n").trim().to_string()
+    }
+
+    fn metadata_markdown(&self) -> String {
+        let occurred_at = if self.started_at.is_empty() {
+            &self.created_at
+        } else {
+            &self.started_at
+        };
+        let mut lines = vec![
+            format!("- ID: `{}`", self.id),
+            format!("- Date: {occurred_at}"),
+        ];
+        if !self.series_id.is_empty() {
+            lines.push(format!("- Series: `{}`", self.series_id));
+        }
+        if let Some(folder_path) = &self.folder_path {
+            lines.push(format!("- Folder: `{folder_path}`"));
+        }
+        let people = self
+            .participants
+            .iter()
+            .filter_map(|participant| {
+                let name = participant.display_name.trim();
+                (!name.is_empty()).then_some(name)
+            })
+            .collect::<Vec<_>>();
+        if !people.is_empty() {
+            lines.push(format!("- Participants: {}", people.join(", ")));
+        }
+        lines.join("\n")
+    }
+}
+
+impl MeetingExport {
+    pub fn to_markdown(&self) -> String {
+        let mut markdown = self.meeting.to_markdown();
+        let transcript = transcript_render::render_transcripts_markdown(self);
+        if !transcript.is_empty() {
+            markdown.push_str("\n\n## Transcript\n\n");
+            markdown.push_str(&transcript);
+        }
+        markdown
+    }
+}
+
+impl From<anlg_db_app::SessionListItem> for MeetingListItem {
+    fn from(value: anlg_db_app::SessionListItem) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            kind: value.kind,
+            status: value.status,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            started_at: value.started_at,
+            ended_at: value.ended_at,
+            series_id: value.series_id,
+            folder_path: stored_folder_path(value.folder_path),
+        }
+    }
+}
+
+impl From<&Meeting> for MeetingListItem {
+    fn from(value: &Meeting) -> Self {
+        Self {
+            id: value.id.clone(),
+            title: value.title.clone(),
+            kind: value.kind.clone(),
+            status: value.status.clone(),
+            created_at: value.created_at.clone(),
+            updated_at: value.updated_at.clone(),
+            started_at: value.started_at.clone(),
+            ended_at: value.ended_at.clone(),
+            series_id: value.series_id.clone(),
+            folder_path: value.folder_path.clone(),
+        }
+    }
+}
+
+impl Folder {
+    fn from_path(path: &str) -> Self {
+        let (parent_path, name) = match path.rsplit_once('/') {
+            Some((parent, name)) => (Some(parent.to_string()), name),
+            None => (None, path),
+        };
+        Self {
+            path: path.to_string(),
+            name: name.to_string(),
+            parent_path,
+        }
+    }
+}
+
+fn stored_folder_path(path: String) -> Option<String> {
+    (!path.trim().is_empty()).then_some(path)
+}
+
+/// Mirrors the desktop folder-path rules: returns `Some("")` for blank input
+/// and `None` for absolute paths or empty, `.`, or `..` segments.
+fn normalize_folder_path(path: &str) -> Option<String> {
+    let path = path.replace('\\', "/");
+    let path = path.trim();
+    if path.starts_with('/') {
+        return None;
+    }
+    let path = path.trim_end_matches('/');
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return path.is_empty().then(String::new);
+    }
+    Some(path.to_string())
+}
+
+impl From<anlg_db_app::SessionDocumentRow> for Document {
+    fn from(value: anlg_db_app::SessionDocumentRow) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            template_id: value.template_id,
+            title: value.title,
+            markdown: body_to_markdown(&value.body, &value.body_format),
+            sort_order: value.sort_order,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+impl From<anlg_db_app::SessionParticipantRow> for Participant {
+    fn from(value: anlg_db_app::SessionParticipantRow) -> Self {
+        Self {
+            human_id: value.human_id,
+            display_name: value.display_name,
+            email: value.email,
+            role: value.role,
+            job_title: value.job_title,
+            organization_id: value.organization_id,
+            organization_name: value.organization_name,
+        }
+    }
+}
+
+impl From<anlg_db_app::SessionActionItemRow> for ActionItem {
+    fn from(value: anlg_db_app::SessionActionItemRow) -> Self {
+        Self {
+            id: value.id,
+            assignee_human_id: value.assignee_human_id,
+            status: value.status,
+            text: value.text,
+            due_at: value.due_at,
+            completed_at: value.completed_at,
+        }
+    }
+}
+
+impl From<anlg_db_app::SessionTranscriptRow> for Transcript {
+    fn from(value: anlg_db_app::SessionTranscriptRow) -> Self {
+        let words = json_array(&value.words_json);
+        let text = transcript_text(&words);
+        Self {
+            id: value.id,
+            source: value.source,
+            provider: value.provider,
+            model: value.model,
+            language: value.language,
+            started_at_ms: value.started_at_ms,
+            ended_at_ms: value.ended_at_ms,
+            memo: value.memo,
+            text,
+            words,
+            speaker_hints: json_array(&value.speaker_hints_json),
+        }
+    }
+}
+
+async fn load_transcripts(pool: &SqlitePool, meeting_id: &str) -> Result<Vec<Transcript>> {
+    load_transcript_rows(pool, meeting_id)
+        .await
+        .map(|rows| rows.into_iter().map(Transcript::from).collect())
+}
+
+async fn load_transcript_rows(
+    pool: &SqlitePool,
+    meeting_id: &str,
+) -> Result<Vec<anlg_db_app::SessionTranscriptRow>> {
+    anlg_db_app::list_session_transcripts(pool, meeting_id)
+        .await
+        .map_err(|source| Error::Database {
+            action: "load transcript",
+            source,
+        })
+}
+
+pub fn paginate_transcripts(
+    meeting_id: &str,
+    transcripts: &[Transcript],
+    offset: u32,
+    limit: u32,
+) -> TranscriptPage {
+    let limit = limit.clamp(1, MAX_TRANSCRIPT_LIMIT);
+    let mut words = Vec::new();
+    for transcript in transcripts {
+        for word in &transcript.words {
+            let mut word = word.clone();
+            if let Some(object) = word.as_object_mut() {
+                object.insert(
+                    "transcript_id".to_string(),
+                    Value::String(transcript.id.clone()),
+                );
+            }
+            words.push(word);
+        }
+    }
+
+    let total_words = words.len();
+    let offset_usize = offset as usize;
+    let limit = limit.clamp(1, MAX_TRANSCRIPT_LIMIT);
+    let words = words
+        .into_iter()
+        .skip(offset_usize)
+        .take(limit as usize)
+        .collect::<Vec<_>>();
+    let text = if total_words == 0 && offset_usize == 0 {
+        transcript_render::render_flat_transcripts(transcripts)
+    } else {
+        transcript_page_text(&words)
+    };
+    let has_more = offset_usize.saturating_add(words.len()) < total_words;
+
+    TranscriptPage {
+        meeting_id: meeting_id.to_string(),
+        text,
+        pagination: pagination(offset, limit, words.len(), Some(total_words), has_more),
+        words,
+    }
+}
+
+fn body_to_markdown(body: &str, format: &str) -> String {
+    if format != "prosemirror_json" {
+        return body.to_string();
+    }
+    serde_json::from_str(body)
+        .ok()
+        .and_then(|value| anlg_tiptap::tiptap_json_to_md(&value).ok())
+        .map(|markdown| markdown.trim_end().to_string())
+        .unwrap_or_else(|| body.to_string())
+}
+
+fn json_array(value: &str) -> Vec<Value> {
+    serde_json::from_str(value).unwrap_or_default()
+}
+
+fn transcript_text(words: &[Value]) -> String {
+    words
+        .iter()
+        .filter_map(|word| word.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn transcript_page_text(words: &[Value]) -> String {
+    let mut segments = Vec::new();
+    let mut transcript_id = None;
+    let mut segment = Vec::new();
+
+    for word in words {
+        let next_transcript_id = word.get("transcript_id").and_then(Value::as_str);
+        if transcript_id.is_some() && transcript_id != next_transcript_id {
+            segments.push(segment.join(" "));
+            segment.clear();
+        }
+        transcript_id = next_transcript_id;
+
+        if let Some(text) = word.get("text").and_then(Value::as_str) {
+            let text = text.trim();
+            if !text.is_empty() {
+                segment.push(text);
+            }
+        }
+    }
+
+    if !segment.is_empty() {
+        segments.push(segment.join(" "));
+    }
+
+    segments.join("\n\n")
+}
+
+fn push_section(sections: &mut Vec<String>, title: &str, body: &str) {
+    if !body.trim().is_empty() {
+        sections.push(format!("## {title}\n\n{}", body.trim()));
+    }
+}
+
+pub(crate) fn pagination(
+    offset: u32,
+    limit: u32,
+    returned: usize,
+    total: Option<usize>,
+    has_more: bool,
+) -> Pagination {
+    Pagination {
+        offset,
+        limit,
+        returned,
+        total,
+        next_offset: has_more.then(|| offset.saturating_add(returned as u32)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_db() -> anlg_db_core::Db {
+        let db = anlg_db_core::Db::connect_memory_plain().await.unwrap();
+        anlg_db_app::prepare_schema(&db).await.unwrap();
+        db
+    }
+
+    #[test]
+    fn converts_prosemirror_and_tolerates_invalid_json() {
+        let body = serde_json::json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Hello"}]
+            }]
+        })
+        .to_string();
+        assert_eq!(body_to_markdown(&body, "prosemirror_json"), "Hello");
+        assert_eq!(body_to_markdown("{broken", "prosemirror_json"), "{broken");
+    }
+
+    #[test]
+    fn transcript_text_uses_word_text() {
+        let words = serde_json::json!([
+            {"text": " Hello "},
+            {"text": "world."},
+            {"other": "ignored"}
+        ]);
+        assert_eq!(transcript_text(words.as_array().unwrap()), "Hello world.");
+    }
+
+    #[test]
+    fn transcript_page_text_preserves_transcript_boundaries() {
+        let words = serde_json::json!([
+            {"text": "First segment", "transcript_id": "transcript-1"},
+            {"text": "continues.", "transcript_id": "transcript-1"},
+            {"text": "Second segment.", "transcript_id": "transcript-2"}
+        ]);
+
+        assert_eq!(
+            transcript_page_text(words.as_array().unwrap()),
+            "First segment continues.\n\nSecond segment."
+        );
+    }
+
+    #[test]
+    fn transcript_page_uses_stored_text_without_word_payloads() {
+        let transcripts = [
+            Transcript {
+                id: "transcript-1".to_string(),
+                source: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                language: "en".to_string(),
+                started_at_ms: 0,
+                ended_at_ms: None,
+                memo: String::new(),
+                text: "First transcript.".to_string(),
+                words: Vec::new(),
+                speaker_hints: Vec::new(),
+            },
+            Transcript {
+                id: "transcript-2".to_string(),
+                source: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                language: "en".to_string(),
+                started_at_ms: 0,
+                ended_at_ms: None,
+                memo: String::new(),
+                text: "Second transcript.".to_string(),
+                words: Vec::new(),
+                speaker_hints: Vec::new(),
+            },
+        ];
+
+        let page = paginate_transcripts("meeting-1", &transcripts, 0, 100);
+
+        assert_eq!(page.text, "First transcript.\n\nSecond transcript.");
+        assert!(page.words.is_empty());
+        assert_eq!(page.pagination.total, Some(0));
+        assert_eq!(page.pagination.next_offset, None);
+    }
+
+    #[tokio::test]
+    async fn meeting_export_markdown_labels_speakers() {
+        let db = test_db().await;
+        sqlx::query(
+            "INSERT INTO sessions (id, title, started_at, owner_user_id)
+             VALUES ('meeting-1', 'Planning', '2026-07-13', 'self-1')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO humans (id, name) VALUES ('self-1', 'Me'), ('human-1', 'Alice')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO session_participants (id, session_id, human_id, display_name)
+             VALUES ('participant-1', 'meeting-1', 'human-1', 'Alice')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let words = serde_json::json!([
+            {"id": "w1", "text": "Hello", "start_ms": 0, "end_ms": 400, "channel": 0},
+            {"id": "w2", "text": "there", "start_ms": 500, "end_ms": 900, "channel": 0},
+            {"id": "w3", "text": "Hi", "start_ms": 1000, "end_ms": 1400, "channel": 1},
+        ]);
+        let hints = serde_json::json!([{
+            "type": "user_speaker_assignment",
+            "word_id": "w3",
+            "value": {"human_id": "human-1", "scope": "speaker", "channel": 1, "speaker_index": null},
+        }]);
+        sqlx::query(
+            "INSERT INTO transcripts
+             (id, session_id, owner_user_id, started_at_ms, words_json, speaker_hints_json)
+             VALUES ('transcript-1', 'meeting-1', 'self-1', 0, ?, ?)",
+        )
+        .bind(words.to_string())
+        .bind(hints.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let export = get_meeting_export(db.pool(), "meeting-1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            export.speakers,
+            vec![
+                Speaker {
+                    human_id: "human-1".to_string(),
+                    name: "Alice".to_string(),
+                    is_self: false,
+                },
+                Speaker {
+                    human_id: "self-1".to_string(),
+                    name: "Me".to_string(),
+                    is_self: true,
+                },
+            ]
+        );
+        let markdown = export.to_markdown();
+        assert!(
+            markdown.ends_with("## Transcript\n\nMe: Hello there\n\nAlice: Hi"),
+            "{markdown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn operations_return_curated_meeting_data() {
+        let db = test_db().await;
+        sqlx::query(
+            "INSERT INTO sessions
+             (id, title, started_at, series_id, workspace_id, owner_user_id, metadata_json)
+             VALUES
+             ('meeting-1', 'Planning', '2026-07-13', 'series-1', 'workspace-1', 'owner-1', '{\"private\":true}'),
+             ('meeting-2', 'Prior planning', '2026-07-06', 'series-1', 'workspace-1', 'owner-1', '{}')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sessions SET folder_path = 'Projects/Launch' WHERE id = 'meeting-1'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO session_documents
+             (id, session_id, kind, body_format, body, title)
+             VALUES
+             ('meeting-1', 'meeting-1', 'note', 'markdown', 'Launch decision', 'Notes'),
+             ('summary-1', 'meeting-1', 'summary', 'markdown', 'Ship Tuesday', 'Summary')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO session_participants
+             (id, session_id, human_id, display_name, email, role, metadata_json)
+             VALUES ('participant-1', 'meeting-1', 'human-1', 'Alice', 'alice@example.com', 'attendee', '{\"private\":true}')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO action_items
+             (id, session_id, assignee_human_id, status, text, due_at, metadata_json)
+             VALUES ('action-1', 'meeting-1', 'human-1', 'open', 'Prepare launch', '2026-07-20', '{\"private\":true}')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO transcripts
+             (id, session_id, started_at_ms, words_json, memo, metadata_json)
+             VALUES ('transcript-1', 'meeting-1', 0, '[{\"text\":\"one\"},{\"text\":\"two\"}]', 'internal memo', '{\"private\":true}')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let listed = list_meetings(
+            db.pool(),
+            ListMeetingsInput {
+                query: Some("plan".to_string()),
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.meetings[0].id, "meeting-1");
+        assert_eq!(listed.pagination.next_offset, Some(1));
+        assert_eq!(
+            listed.meetings[0].folder_path.as_deref(),
+            Some("Projects/Launch")
+        );
+
+        let meeting = get_meeting(
+            db.pool(),
+            GetMeetingInput {
+                meeting_id: "meeting-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(meeting.note.as_ref().unwrap().markdown, "Launch decision");
+        assert_eq!(meeting.folder_path.as_deref(), Some("Projects/Launch"));
+        assert!(
+            meeting
+                .to_markdown()
+                .contains("- Folder: `Projects/Launch`")
+        );
+        assert_eq!(meeting.participants[0].display_name, "Alice");
+        assert_eq!(meeting.action_items[0].text, "Prepare launch");
+        let serialized = serde_json::to_value(&meeting).unwrap();
+        assert!(serialized.get("workspace_id").is_none());
+        assert!(serialized.get("owner_user_id").is_none());
+        assert!(serialized.get("metadata_json").is_none());
+        assert!(serialized["participants"][0].get("metadata_json").is_none());
+
+        let transcript = get_meeting_transcript(
+            db.pool(),
+            GetMeetingTranscriptInput {
+                meeting_id: "meeting-1".to_string(),
+                offset: Some(1),
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(transcript.text, "two");
+        assert_eq!(transcript.pagination.total, Some(2));
+        assert_eq!(transcript.words[0]["transcript_id"], "transcript-1");
+
+        let history = get_recurring_meeting_history(
+            db.pool(),
+            GetRecurringMeetingHistoryInput {
+                meeting_id: "meeting-1".to_string(),
+                limit: None,
+                offset: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            history
+                .meetings
+                .iter()
+                .map(|meeting| meeting.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["meeting-1", "meeting-2"]
+        );
+        assert_eq!(history.meetings[1].folder_path, None);
+    }
+
+    #[tokio::test]
+    async fn folders_are_listed_and_filter_meetings() {
+        let db = test_db().await;
+        sqlx::query(
+            "INSERT INTO sessions (id, title, started_at, folder_path)
+             VALUES
+             ('launch', 'Launch', '2026-07-03', 'Projects/Launch'),
+             ('design', 'Design', '2026-07-02', 'Projects/Launch/Design'),
+             ('acme', 'ACME', '2026-07-01', 'Clients/ACME'),
+             ('unfiled', 'Unfiled', '2026-06-30', '')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO folders (id, path) VALUES ('empty', 'Projects/Empty')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let folders = list_folders(db.pool(), ListFoldersInput::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            folders
+                .folders
+                .iter()
+                .map(|folder| folder.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Clients",
+                "Clients/ACME",
+                "Projects",
+                "Projects/Empty",
+                "Projects/Launch",
+                "Projects/Launch/Design",
+            ]
+        );
+        assert_eq!(
+            folders.folders[5],
+            Folder {
+                path: "Projects/Launch/Design".to_string(),
+                name: "Design".to_string(),
+                parent_path: Some("Projects/Launch".to_string()),
+            }
+        );
+        assert_eq!(folders.folders[0].parent_path, None);
+        assert_eq!(folders.pagination.total, Some(6));
+
+        let searched = list_folders(
+            db.pool(),
+            ListFoldersInput {
+                query: Some("launch".to_string()),
+                limit: Some(1),
+                offset: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(searched.folders[0].path, "Projects/Launch");
+        assert_eq!(searched.pagination.total, Some(2));
+        assert_eq!(searched.pagination.next_offset, Some(1));
+
+        let in_folder = list_meetings(
+            db.pool(),
+            ListMeetingsInput {
+                folder_path: Some(" Projects/Launch/ ".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            in_folder
+                .meetings
+                .iter()
+                .map(|meeting| meeting.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["launch", "design"]
+        );
+
+        let all = list_meetings(
+            db.pool(),
+            ListMeetingsInput {
+                folder_path: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.meetings.len(), 4);
+        assert_eq!(all.meetings[3].folder_path, None);
+
+        let invalid = list_meetings(
+            db.pool(),
+            ListMeetingsInput {
+                folder_path: Some("../Projects".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(matches!(invalid, Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn meeting_records_without_folder_path_deserialize() {
+        let meeting: Meeting = serde_json::from_value(serde_json::json!({
+            "id": "meeting-1",
+            "title": "Planning",
+            "kind": "meeting",
+            "status": "active",
+            "created_at": "2026-07-13",
+            "updated_at": "2026-07-13",
+            "started_at": "",
+            "ended_at": "",
+            "timezone": "",
+            "language": "",
+            "series_id": "",
+            "note": null,
+            "summaries": [],
+            "participants": [],
+            "action_items": []
+        }))
+        .unwrap();
+        assert_eq!(meeting.folder_path, None);
+        assert_eq!(MeetingListItem::from(&meeting).folder_path, None);
+    }
+}

@@ -1,0 +1,325 @@
+import type { MarkdownExportOptions } from "@anlg/plugin-local-api";
+
+import {
+  DEFAULT_MARKDOWN_EXPORT_OPTIONS,
+  hasMarkdownExportContent,
+  parseMarkdownExportOptions,
+} from "./markdown-export";
+import type { AutomationRunRecord, AutomationTargetRef } from "./types";
+
+import {
+  getStoredSettingValues,
+  setSettingValue,
+  useStoredSettingValue,
+} from "~/settings/queries";
+import { id } from "~/shared/utils";
+
+const WORKFLOW_TRIGGERS = ["note_enhanced", "meeting_completed"] as const;
+export type WorkflowTrigger = (typeof WORKFLOW_TRIGGERS)[number];
+
+const WORKFLOW_STEP_TYPES = [
+  "slack_recap",
+  "notion_update",
+  "linear_issues",
+  "markdown_export",
+  "google_drive_export",
+] as const;
+export type WorkflowStepType = (typeof WORKFLOW_STEP_TYPES)[number];
+
+type DriveExportFormat = "markdown" | "google_docs";
+
+export type DriveExportRun = {
+  format?: DriveExportFormat;
+  sessionId: string;
+  stepId: string;
+  connectionId: string;
+  folderId: string;
+  fileId?: string;
+  status: "pending" | "success" | "error";
+  detail: string;
+  at: string;
+};
+
+export type WorkflowStep =
+  | {
+      id: string;
+      type: "google_drive_export";
+      format?: DriveExportFormat;
+      connectionId: string;
+      target: AutomationTargetRef | null;
+    }
+  | {
+      id: string;
+      type: "slack_recap" | "notion_update" | "linear_issues";
+      target: AutomationTargetRef | null;
+    }
+  | {
+      id: string;
+      type: "markdown_export";
+      directory: string;
+      options?: MarkdownExportOptions;
+    };
+
+export type AutomationWorkflow = {
+  id: string;
+  title: string;
+  enabled: boolean;
+  trigger: WorkflowTrigger;
+  steps: WorkflowStep[];
+  lastRun: AutomationRunRecord | null;
+  processedSessionIds: string[];
+  chatGroupId: string | null;
+  driveExports?: DriveExportRun[];
+};
+
+export const GOOGLE_DRIVE_STARTER_WORKFLOW_ID = "starter-google-drive";
+
+export function createGoogleDriveWorkflow(title: string): AutomationWorkflow {
+  return createEmptyWorkflow({
+    title,
+    trigger: "note_enhanced",
+    steps: [
+      {
+        id: id(),
+        type: "google_drive_export",
+        connectionId: "",
+        target: null,
+        format: "markdown",
+      },
+    ],
+  });
+}
+
+export function createEmptyWorkflow(
+  overrides: Partial<AutomationWorkflow> = {},
+): AutomationWorkflow {
+  return {
+    id: overrides.id ?? id(),
+    title: overrides.title ?? "Untitled automation",
+    enabled: overrides.enabled ?? false,
+    trigger: overrides.trigger ?? "note_enhanced",
+    steps: overrides.steps ?? [],
+    lastRun: overrides.lastRun ?? null,
+    processedSessionIds: overrides.processedSessionIds ?? [],
+    chatGroupId: overrides.chatGroupId ?? null,
+    ...(overrides.driveExports ? { driveExports: overrides.driveExports } : {}),
+  };
+}
+
+export function createWorkflowStep(type: WorkflowStepType): WorkflowStep {
+  if (type === "google_drive_export") {
+    return { id: id(), type, connectionId: "", target: null };
+  }
+  if (type === "markdown_export") {
+    return {
+      id: id(),
+      type,
+      directory: "",
+      options: { ...DEFAULT_MARKDOWN_EXPORT_OPTIONS },
+    };
+  }
+  return { id: id(), type, target: null };
+}
+
+export function isWorkflowStepReady(step: WorkflowStep): boolean {
+  if (step.type === "google_drive_export") {
+    return !!step.connectionId && !!step.target?.id;
+  }
+  if (step.type === "markdown_export") {
+    return (
+      step.directory.trim().length > 0 &&
+      hasMarkdownExportContent(step.options ?? DEFAULT_MARKDOWN_EXPORT_OPTIONS)
+    );
+  }
+  return step.target !== null;
+}
+
+export function isWorkflowReady(workflow: AutomationWorkflow): boolean {
+  return (
+    workflow.steps.length > 0 &&
+    workflow.steps.every(isWorkflowStepReady) &&
+    (workflow.trigger === "note_enhanced" ||
+      !workflow.steps.some((step) => step.type === "google_drive_export"))
+  );
+}
+
+export function parseAutomationWorkflows(
+  value: string | undefined,
+): AutomationWorkflow[] {
+  if (!value) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.flatMap((item) => {
+      const workflow = parseWorkflow(item);
+      return workflow ? [workflow] : [];
+    });
+  } catch {
+    return [];
+  }
+}
+
+export function serializeAutomationWorkflows(
+  workflows: AutomationWorkflow[],
+): string {
+  return JSON.stringify(workflows);
+}
+
+export async function saveAutomationWorkflows(
+  workflows: AutomationWorkflow[],
+): Promise<void> {
+  await setSettingValue(
+    "automation_workflows",
+    serializeAutomationWorkflows(workflows),
+  );
+}
+
+export function useAutomationWorkflows(): AutomationWorkflow[] {
+  return parseAutomationWorkflows(
+    useStoredSettingValue("automation_workflows").value,
+  );
+}
+
+function parseWorkflow(value: unknown): AutomationWorkflow | null {
+  if (!isRecord(value) || typeof value.id !== "string") {
+    return null;
+  }
+
+  const trigger =
+    value.trigger === "meeting_completed"
+      ? "meeting_completed"
+      : "note_enhanced";
+  const steps = Array.isArray(value.steps)
+    ? value.steps.flatMap((step) => {
+        const parsed = parseStep(step);
+        return parsed ? [parsed] : [];
+      })
+    : [];
+
+  return {
+    id: value.id,
+    title:
+      typeof value.title === "string" ? value.title : "Untitled automation",
+    enabled: value.enabled === true,
+    trigger,
+    steps,
+    lastRun: parseLastRun(value.lastRun),
+    processedSessionIds: Array.isArray(value.processedSessionIds)
+      ? value.processedSessionIds.filter(
+          (entry): entry is string => typeof entry === "string",
+        )
+      : [],
+    ...(Array.isArray(value.driveExports)
+      ? { driveExports: value.driveExports.filter(isDriveExportRun) }
+      : {}),
+    chatGroupId:
+      typeof value.chatGroupId === "string" ? value.chatGroupId : null,
+  };
+}
+
+function parseStep(value: unknown): WorkflowStep | null {
+  if (!isRecord(value) || typeof value.id !== "string") {
+    return null;
+  }
+  if (value.type === "google_drive_export") {
+    return {
+      id: value.id,
+      type: "google_drive_export",
+      ...(value.format === "google_docs"
+        ? { format: "google_docs" as const }
+        : {}),
+      connectionId:
+        typeof value.connectionId === "string" ? value.connectionId : "",
+      target: parseTarget(value.target),
+    };
+  }
+  if (value.type === "markdown_export") {
+    return {
+      id: value.id,
+      type: "markdown_export",
+      directory: typeof value.directory === "string" ? value.directory : "",
+      ...(value.options !== undefined
+        ? { options: parseMarkdownExportOptions(value.options) }
+        : {}),
+    };
+  }
+  if (
+    value.type === "slack_recap" ||
+    value.type === "notion_update" ||
+    value.type === "linear_issues"
+  ) {
+    return {
+      id: value.id,
+      type: value.type,
+      target: parseTarget(value.target),
+    };
+  }
+  return null;
+}
+
+function parseTarget(value: unknown): AutomationTargetRef | null {
+  if (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string"
+  ) {
+    return { id: value.id, name: value.name };
+  }
+  return null;
+}
+
+function parseLastRun(value: unknown): AutomationRunRecord | null {
+  if (
+    isRecord(value) &&
+    typeof value.at === "string" &&
+    (value.status === "success" || value.status === "error") &&
+    typeof value.detail === "string"
+  ) {
+    return {
+      at: value.at,
+      status: value.status,
+      detail: value.detail,
+    };
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isDriveExportRun(value: unknown): value is DriveExportRun {
+  return (
+    isRecord(value) &&
+    ["sessionId", "stepId", "connectionId", "folderId", "detail", "at"].every(
+      (key) => typeof value[key] === "string",
+    ) &&
+    (value.format === undefined ||
+      value.format === "markdown" ||
+      value.format === "google_docs") &&
+    (value.fileId === undefined || typeof value.fileId === "string") &&
+    ["pending", "success", "error"].includes(String(value.status))
+  );
+}
+
+let workflowWriteQueue: Promise<void> = Promise.resolve();
+
+export function mutateAutomationWorkflows(
+  update: (workflows: AutomationWorkflow[]) => AutomationWorkflow[],
+): Promise<void> {
+  const next = workflowWriteQueue.then(async () => {
+    const { values } = await getStoredSettingValues();
+    await setSettingValue(
+      "automation_workflows",
+      serializeAutomationWorkflows(
+        update(parseAutomationWorkflows(values.automation_workflows)),
+      ),
+    );
+  });
+  workflowWriteQueue = next.catch(() => {});
+  return next;
+}

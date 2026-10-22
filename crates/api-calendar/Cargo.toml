@@ -1,0 +1,25 @@
+[package]
+name = "api-calendar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anlg-api-auth = { workspace = true }
+anlg-api-error = { workspace = true }
+anlg-api-nango = { workspace = true }
+anlg-google-calendar = { workspace = true, features = ["utoipa"] }
+anlg-nango = { workspace = true }
+anlg-outlook-calendar = { workspace = true, features = ["utoipa"] }
+
+chrono = { workspace = true, features = ["serde"] }
+
+axum = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

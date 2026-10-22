@@ -1,0 +1,199 @@
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use futures_util::{Stream, StreamExt};
+
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    #[error("no input device found")]
+    NoInputDevice,
+    #[error("mic_open_failed")]
+    MicOpenFailed,
+    #[error("mic_stream_setup_failed")]
+    MicStreamSetupFailed,
+    #[error("microphone capture initialization failed: {0}")]
+    MicStreamInitializationFailed(String),
+    #[error("speaker_stream_setup_failed")]
+    SpeakerStreamSetupFailed,
+    #[error("system audio capture initialization failed: {0}")]
+    SpeakerStreamInitializationFailed(String),
+    #[error("mic_resample_failed")]
+    MicResampleFailed,
+    #[error("speaker_resample_failed")]
+    SpeakerResampleFailed,
+    #[error("mic_stream_ended")]
+    MicStreamEnded,
+    #[error("speaker_stream_ended")]
+    SpeakerStreamEnded,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptureConfig {
+    pub sample_rate: u32,
+    pub chunk_size: usize,
+    pub mic_device: Option<String>,
+    pub enable_aec: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptureFrame {
+    pub raw_mic: Arc<[f32]>,
+    pub raw_speaker: Arc<[f32]>,
+    pub aec_mic: Option<Arc<[f32]>>,
+}
+
+impl CaptureFrame {
+    pub fn preferred_mic(&self) -> Arc<[f32]> {
+        self.aec_mic
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::clone(&self.raw_mic))
+    }
+
+    pub fn raw_dual(&self) -> (Arc<[f32]>, Arc<[f32]>) {
+        (Arc::clone(&self.raw_mic), Arc::clone(&self.raw_speaker))
+    }
+
+    pub fn aec_dual(&self) -> (Arc<[f32]>, Arc<[f32]>) {
+        (self.preferred_mic(), Arc::clone(&self.raw_speaker))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureChannel {
+    Mic,
+    Speaker,
+}
+
+pub enum CaptureEvent {
+    Frame(CaptureFrame),
+    // Clock padding preserves offsets without claiming that a device delivered audio.
+    Gap(CaptureFrame),
+    ChannelReady {
+        channel: CaptureChannel,
+        device: Option<String>,
+    },
+    ChannelFailed {
+        channel: CaptureChannel,
+        error: Error,
+    },
+}
+
+type CaptureRetry = dyn Fn(Option<String>, bool) + Send + Sync;
+
+pub struct CaptureStream {
+    inner: Pin<Box<dyn Stream<Item = Result<CaptureEvent, Error>> + Send>>,
+    retry: Option<Box<CaptureRetry>>,
+    output_changed: Option<Box<dyn Fn(bool) + Send + Sync>>,
+}
+
+impl CaptureStream {
+    pub fn new(stream: impl Stream<Item = Result<CaptureFrame, Error>> + Send + 'static) -> Self {
+        Self::with_events(stream.map(|item| item.map(CaptureEvent::Frame)))
+    }
+
+    pub fn with_events(
+        stream: impl Stream<Item = Result<CaptureEvent, Error>> + Send + 'static,
+    ) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            retry: None,
+            output_changed: None,
+        }
+    }
+
+    pub fn with_retry(
+        mut self,
+        retry: impl Fn(Option<String>, bool) + Send + Sync + 'static,
+    ) -> Self {
+        self.retry = Some(Box::new(retry));
+        self
+    }
+
+    pub fn retry(&self, device: Option<String>, force_mic: bool) {
+        if let Some(retry) = &self.retry {
+            retry(device, force_mic);
+        }
+    }
+
+    pub fn with_output_change(mut self, update: impl Fn(bool) + Send + Sync + 'static) -> Self {
+        self.output_changed = Some(Box::new(update));
+        self
+    }
+
+    pub fn update_output(&self, enable_aec: bool) {
+        if let Some(update) = &self.output_changed {
+            update(enable_aec);
+        }
+    }
+
+    pub async fn next_event(&mut self) -> Option<Result<CaptureEvent, Error>> {
+        self.inner.next().await
+    }
+}
+
+impl Stream for CaptureStream {
+    type Item = Result<CaptureFrame, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(CaptureEvent::Frame(frame) | CaptureEvent::Gap(frame)))) => {
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                Poll::Ready(Some(Ok(_))) => continue,
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+pub trait AudioProvider: Send + Sync {
+    fn open_capture(&self, config: CaptureConfig) -> Result<CaptureStream, Error>;
+    fn open_speaker_capture(
+        &self,
+        sample_rate: u32,
+        chunk_size: usize,
+    ) -> Result<CaptureStream, Error>;
+    fn open_mic_capture(
+        &self,
+        device: Option<String>,
+        sample_rate: u32,
+        chunk_size: usize,
+    ) -> Result<CaptureStream, Error>;
+
+    fn default_device_name(&self) -> String;
+    fn list_mic_devices(&self) -> Vec<String>;
+
+    fn play_silence(&self) -> std::sync::mpsc::Sender<()>;
+    fn play_bytes(&self, bytes: &'static [u8]) -> std::sync::mpsc::Sender<()>;
+
+    fn probe_mic(&self, device: Option<String>) -> Result<(), Error>;
+    fn probe_speaker(&self) -> Result<(), Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aec_dual_prefers_aec_mic_and_falls_back_to_raw_mic() {
+        let mut frame = CaptureFrame {
+            raw_mic: Arc::from([0.1_f32, 0.2]),
+            raw_speaker: Arc::from([0.3_f32, 0.4]),
+            aec_mic: Some(Arc::from([0.9_f32, 1.0])),
+        };
+
+        let (aec_mic, aec_speaker) = frame.aec_dual();
+        assert_eq!(&*aec_mic, &[0.9, 1.0]);
+        assert_eq!(&*aec_speaker, &[0.3, 0.4]);
+
+        frame.aec_mic = None;
+        let (fallback_mic, fallback_speaker) = frame.aec_dual();
+        assert_eq!(&*fallback_mic, &[0.1, 0.2]);
+        assert_eq!(&*fallback_speaker, &[0.3, 0.4]);
+    }
+}
