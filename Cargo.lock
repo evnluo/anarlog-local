@@ -4609,7 +4609,6 @@ dependencies = [
  "tauri-plugin-auth",
  "tauri-plugin-automation",
  "tauri-plugin-autostart",
- "tauri-plugin-bedrock",
  "tauri-plugin-calendar",
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-db",

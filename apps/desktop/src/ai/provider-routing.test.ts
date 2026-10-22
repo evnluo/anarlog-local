@@ -65,6 +65,7 @@ it.each([undefined, "https://api.anarlog.so"])(
     const { env } = await import("~/env");
     expect(stt.map((provider) => provider.id)).not.toContain("anarlog");
     expect(llm.map((provider) => provider.id)).not.toContain("anarlog");
+    expect(llm.map((provider) => provider.id)).not.toContain("bedrock");
     expect(env.VITE_API_URL).toBe("http://localhost:3001");
   },
   30_000,

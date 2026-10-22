@@ -277,9 +277,7 @@ pub fn main() {
         builder = builder.plugin(tauri_plugin_agent::init());
     }
 
-    builder = builder
-        .plugin(tauri_plugin_db::init(db.clone()))
-        .plugin(tauri_plugin_bedrock::init());
+    builder = builder.plugin(tauri_plugin_db::init(db.clone()));
 
     builder = builder
         .plugin(tauri_plugin_importer::init())

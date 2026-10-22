@@ -82,6 +82,7 @@ jobs:
           .github/workflows/macos-arm64.yml
           Cargo.toml
           apps/desktop/package.json
+          apps/desktop/src-tauri/Cargo.toml
           packages/editor/package.json
           pnpm-workspace.yaml
           rust-toolchain.toml

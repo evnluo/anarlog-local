@@ -29,6 +29,7 @@ describe("Anarlog Local distribution identity", () => {
     expect(config.plugins?.updater?.active).toBe(false);
     const nativeSource = source("src-tauri/src/lib.rs");
     expect(nativeSource).not.toContain("plugin(tauri_plugin_updater");
+    expect(nativeSource).not.toContain("tauri_plugin_bedrock::init");
     expect(nativeSource).toContain("plugin(tauri_plugin_tray::init(false))");
     expect(nativeSource).toContain("plugin(tauri_plugin_db::init(db.clone()))");
     expect(nativeSource).not.toContain("init_with_cloudsync");
