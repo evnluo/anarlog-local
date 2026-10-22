@@ -591,7 +591,7 @@ function useNotificationEvents() {
       return;
     }
 
-    let unlisten: UnlistenFn | null = null;
+    let unlisten: (() => void) | null = null;
     let cancelled = false;
 
     void notificationEvents.notificationEvent
