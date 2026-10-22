@@ -35,6 +35,9 @@ describe("Anarlog Local distribution identity", () => {
     expect(source("src/settings/queries.ts")).not.toContain(
       "@anlg/plugin-updater2",
     );
+    expect(source("src/services/event-listeners.tsx")).not.toContain(
+      "@anlg/plugin-updater2",
+    );
   });
 
   it("has no vendor static-asset default", () => {

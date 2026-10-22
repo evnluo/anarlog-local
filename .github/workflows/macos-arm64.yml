@@ -144,6 +144,8 @@ jobs:
           apps/desktop/src/settings/privacy/index.tsx
           apps/desktop/src/settings/queries.test.tsx
           apps/desktop/src/settings/queries.ts
+          apps/desktop/src/services/event-listeners.test.tsx
+          apps/desktop/src/services/event-listeners.tsx
           apps/desktop/src/shared/main-app-layout.test.tsx
           apps/desktop/src/shared/main-app-layout.tsx
           apps/desktop/src/shared/ui/resource-list/hooks.ts
@@ -171,6 +173,7 @@ jobs:
           src/settings/privacy/index.test.tsx
           src/settings/queries.test.tsx
           src/settings/dictionary/index.test.tsx
+          src/services/event-listeners.test.tsx
           src/sidebar/index.test.tsx
           src/automations/engine.test.ts
 
